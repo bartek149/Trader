@@ -10,7 +10,18 @@ import yfinance as yf
 import threading
 import subprocess
 import sys
+import time
+import streamlit.components.v1 as components
 from stock_predictor import MultiStockPredictor, StockPredictor
+
+# Import modułów logowania i kalibracji (opcjonalnie)
+try:
+    from prediction_logger import PredictionLogger, update_prediction_outcomes
+    from calibration import train_calibrator, find_best_threshold, load_calibrator, load_best_threshold
+    PREDICTION_LOGGING_AVAILABLE = True
+except ImportError:
+    PREDICTION_LOGGING_AVAILABLE = False
+    PredictionLogger = None
 
 def clean_dataframe_for_streamlit(df):
     """Czyści DataFrame z wartości inf, -inf i NaN aby był kompatybilny z Arrow/Streamlit"""
@@ -111,7 +122,7 @@ def get_all_symbols_with_data(data_dir='stock_data'):
     return sorted(list(symbols))
 
 @st.cache_data(ttl=300)  # Cache na 5 minut (krótszy czas, aby szybciej widzieć nowe dane)
-def get_predictions_data(symbols=None, include_all_from_db=True, use_saved_models=True):
+def get_predictions_data(symbols=None, include_all_from_db=True, use_saved_models=True, cache_version=0):
     """Pobierz dane przewidywań dla wszystkich spółek
     
     Parameters:
@@ -153,7 +164,17 @@ def get_predictions_data(symbols=None, include_all_from_db=True, use_saved_model
             
             try:
                 predictor = StockPredictor(symbol, data_dir='stock_data')
+                # Użyj TYLKO lokalnych danych - nie pobieraj z Yahoo
                 predictor.fetch_data(use_saved=True)
+                
+                # Jeśli nie ma lokalnych danych, pomiń tę spółkę
+                if predictor.data is None or len(predictor.data) == 0:
+                    if getattr(predictor, 'data_stale', False):
+                        last_date = predictor.data_stale_last_date.date() if predictor.data_stale_last_date is not None else 'N/D'
+                        errors.append(f"{symbol}: Lokalny cache został usunięty, bo ostatnie notowanie ({last_date}) jest starsze niż 7 dni. Uruchom '🚀 Uruchom Daily Update' aby pobrać świeże dane.")
+                    else:
+                        errors.append(f"{symbol}: Brak zapisanych danych lokalnych. Uruchom '🚀 Uruchom Daily Update' lub użyj przycisku '📥 Pobierz dane' aby pobrać dane z Yahoo.")
+                    continue
                 
                 if predictor.data is not None and len(predictor.data) > 0:
                     # Jeśli mamy zapisany model i chcemy go użyć, załaduj go
@@ -162,33 +183,80 @@ def get_predictions_data(symbols=None, include_all_from_db=True, use_saved_model
                         if loaded_model is not None:
                             # Model załadowany, użyj go do przewidywań
                             predictor.model = loaded_model
-                            predictor.create_features()  # Potrzebne do przewidywań
+                            # Upewnij się, że mamy cechy (z domyślnym horyzontem 1 dzień)
+                            try:
+                                predictor.create_features(horizon_days=1)
+                            except Exception as e:
+                                import traceback
+                                error_details = traceback.format_exc()
+                                errors.append(f"{symbol}: Błąd tworzenia cech: {e}\n{error_details[:500]}")
+                                continue
                         else:
-                            # Brak zapisanego modelu, trenuj nowy (ale tylko jeśli nie ma zapisanego)
-                            predictor.create_features()
-                            predictor.train_model()
-                            # Załaduj informacje o modelu
-                            if predictor.model_file.exists():
-                                with open(predictor.model_file, 'r') as f:
-                                    model_info = json.load(f)
-                            else:
-                                model_info = {}
+                            # Brak zapisanego modelu - nie trenuj automatycznie, tylko zwróć błąd
+                            errors.append(f"{symbol}: Brak zapisanego modelu. Uruchom '🚀 Uruchom Daily Update' aby wytrenować model.")
+                            continue
                     else:
-                        # Zawsze trenuj na nowo
-                        predictor.create_features()
-                        predictor.train_model()
-                        # Załaduj informacje o modelu
-                        if predictor.model_file.exists():
-                            with open(predictor.model_file, 'r') as f:
-                                model_info = json.load(f)
-                        else:
-                            model_info = {}
+                        # use_saved_models=False - nie trenuj automatycznie, tylko zwróć błąd
+                        errors.append(f"{symbol}: Brak zapisanego modelu. Uruchom '🚀 Uruchom Daily Update' aby wytrenować model.")
+                        continue
                     
-                    # Przewidywania na różne okresy
-                    prediction_day = predictor.predict_next_day()
-                    prediction_week = predictor.predict_week()
-                    prediction_month = predictor.predict_month()
-                    prediction_6months = predictor.predict_6months()
+                    # Sprawdź czy model istnieje przed przewidywaniami
+                    if predictor.model is None:
+                        errors.append(f"{symbol}: Brak modelu po trenowaniu")
+                        continue
+                    
+                    # Przewidywania na różne okresy - z obsługą błędów
+                    try:
+                        prediction_day = predictor.predict_next_day()
+                    except Exception as e:
+                        errors.append(f"{symbol}: Błąd przewidywania na 1 dzień: {e}")
+                        continue
+                    
+                    # Przewidywania na tydzień - obsługa błędów
+                    try:
+                        prediction_week = predictor.predict_week()
+                    except Exception as e:
+                        # Jeśli nie ma modelu tygodniowego, użyj standardowego przewidywania na 5 dni
+                        try:
+                            prediction_week = predictor.predict_period(days=5)
+                        except Exception as e2:
+                            # Jeśli to też nie działa, użyj domyślnych wartości
+                            prediction_week = {
+                                'predicted_direction': prediction_day.get('predicted_direction', 'N/A'),
+                                'direction_probability': prediction_day.get('direction_probability', 0.5),
+                                'predicted_price': prediction_day.get('predicted_price', prediction_day.get('current_price', 0)),
+                                'change': 0,
+                                'change_percent': 0
+                            }
+                    
+                    # Przewidywania na miesiąc i 6 miesięcy
+                    try:
+                        prediction_month = predictor.predict_month()
+                    except Exception as e:
+                        try:
+                            prediction_month = predictor.predict_period(days=30)
+                        except:
+                            prediction_month = {
+                                'predicted_direction': prediction_day.get('predicted_direction', 'N/A'),
+                                'direction_probability': prediction_day.get('direction_probability', 0.5),
+                                'predicted_price': prediction_day.get('predicted_price', prediction_day.get('current_price', 0)),
+                                'change': 0,
+                                'change_percent': 0
+                            }
+                    
+                    try:
+                        prediction_6months = predictor.predict_6months()
+                    except Exception as e:
+                        try:
+                            prediction_6months = predictor.predict_period(days=180)
+                        except:
+                            prediction_6months = {
+                                'predicted_direction': prediction_day.get('predicted_direction', 'N/A'),
+                                'direction_probability': prediction_day.get('direction_probability', 0.5),
+                                'predicted_price': prediction_day.get('predicted_price', prediction_day.get('current_price', 0)),
+                                'change': 0,
+                                'change_percent': 0
+                            }
                     
                     results.append({
                         **prediction_day,
@@ -213,16 +281,102 @@ def get_predictions_data(symbols=None, include_all_from_db=True, use_saved_model
             progress_bar.empty()
             status_text.empty()
         
-        # Pokaż błędy jeśli są (tylko jeśli jest mało błędów, żeby nie zaśmiecać UI)
-        if errors and len(errors) <= 20:
-            with st.expander(f"⚠️ Błędy ({len(errors)} spółek)", expanded=False):
-                for error in errors:
-                    st.text(error)
+        # Pokaż błędy jeśli są
+        if errors:
+            # Zawsze pokaż liczbę błędów
+            if len(errors) > 50:
+                # Jeśli jest dużo błędów, pokaż tylko pierwsze 50 i podsumowanie
+                with st.expander(f"⚠️ Błędy ({len(errors)} spółek) - pokazano pierwsze 50", expanded=True):
+                    for error in errors[:50]:
+                        st.text(error)
+                    st.warning(f"... i {len(errors) - 50} więcej błędów")
+            else:
+                with st.expander(f"⚠️ Błędy ({len(errors)} spółek)", expanded=True):
+                    for error in errors:
+                        st.text(error)
+        
+        # Jeśli nie ma wyników, pokaż informację
+        if not results and errors:
+            st.warning(f"⚠️ Nie udało się załadować danych dla żadnej spółki. Wszystkie {len(errors)} spółek miały błędy. Sprawdź szczegóły powyżej.")
         
         return results
     except Exception as e:
         st.error(f"Błąd przy pobieraniu danych: {e}")
         return []
+
+def get_cached_predictions(cache_name, symbols, include_all_from_db=False):
+    """Zwraca dane predykcji z lokalnego cache w session_state dla wskazanego kontekstu."""
+    cache_version = st.session_state.get('cache_version', 0)
+    cache_key = f'{cache_name}_predictions_cache'
+    version_key = f'{cache_name}_predictions_cache_version'
+    
+    if cache_key not in st.session_state or st.session_state.get(version_key) != cache_version:
+        predictions = get_predictions_data(
+            symbols,
+            include_all_from_db=include_all_from_db,
+            use_saved_models=True,
+            cache_version=cache_version
+        )
+        st.session_state[cache_key] = predictions
+        st.session_state[version_key] = cache_version
+    
+    return st.session_state.get(cache_key, [])
+
+def get_dashboard_predictions(symbols, include_all_from_db=False):
+    return get_cached_predictions('dashboard', symbols, include_all_from_db)
+
+def get_dax_predictions(symbols=None, include_all_from_db=True):
+    return get_cached_predictions('dax', symbols, include_all_from_db)
+
+def update_prediction_cache(cache_name, updated_prediction):
+    cache_key = f'{cache_name}_predictions_cache'
+    cache_list = st.session_state.get(cache_key)
+    if not cache_list:
+        return
+    
+    replaced = False
+    for idx, item in enumerate(cache_list):
+        if item.get('symbol') == updated_prediction.get('symbol'):
+            cache_list[idx] = updated_prediction
+            replaced = True
+            break
+    
+    if not replaced:
+        cache_list.append(updated_prediction)
+    
+    st.session_state[cache_key] = list(cache_list)
+
+def update_all_prediction_caches(updated_prediction):
+    update_prediction_cache('dashboard', updated_prediction)
+    update_prediction_cache('dax', updated_prediction)
+
+def navigate_to_details(symbol):
+    """Ustawia spółkę i przełącza użytkownika na zakładkę szczegółów."""
+    st.session_state.selected_symbol = symbol
+    st.session_state.switch_tab_to = "📈 Szczegóły spółki"
+    st.rerun()
+
+def trigger_tab_switch(tab_label):
+    """Wymusza przełączenie zakładki po stronie frontendu (hack JS)."""
+    tab_text = json.dumps(tab_label)
+    switch_js = f"""
+    <script>
+    const targetLabel = {tab_text};
+    const trySwitch = () => {{
+        const tabs = window.parent.document.querySelectorAll('button[role="tab"]');
+        for (const btn of tabs) {{
+            const label = (btn.innerText || btn.textContent || '').trim();
+            if (label === targetLabel) {{
+                btn.click();
+                return;
+            }}
+        }}
+        setTimeout(trySwitch, 100);
+    }};
+    setTimeout(trySwitch, 0);
+    </script>
+    """
+    components.html(switch_js, height=0, width=0)
 
 def get_predictor_for_symbol(symbol, use_saved_model=True):
     """Pobierz predictor dla wybranej spółki (nie cache'owany)
@@ -234,7 +388,7 @@ def get_predictor_for_symbol(symbol, use_saved_model=True):
         predictor = StockPredictor(symbol, data_dir='stock_data')
         predictor.fetch_data(use_saved=True)
         if predictor.data is not None and len(predictor.data) > 0:
-            predictor.create_features()
+            predictor.create_features(horizon_days=1)
             
             # Spróbuj załadować zapisany model
             if use_saved_model:
@@ -242,16 +396,105 @@ def get_predictor_for_symbol(symbol, use_saved_model=True):
                 if loaded_model is not None:
                     predictor.model = loaded_model
                 else:
-                    # Brak zapisanego modelu, trenuj nowy
-                    predictor.train_model()
+                    # Brak zapisanego modelu - nie trenuj automatycznie
+                    st.warning(f"Brak zapisanego modelu dla {symbol}. Uruchom '🚀 Uruchom Daily Update' aby wytrenować model.")
+                    return None
             else:
-                # Zawsze trenuj na nowo
-                predictor.train_model()
+                # use_saved_model=False - nie trenuj automatycznie
+                st.warning(f"Brak zapisanego modelu dla {symbol}. Uruchom '🚀 Uruchom Daily Update' aby wytrenować model.")
+                return None
             
             return predictor
     except Exception as e:
         st.error(f"Błąd przy ładowaniu {symbol}: {e}")
     return None
+
+def run_single_symbol_update(symbol, retrain_weekly=True):
+    """Pobierz dane, wytrenuj modele i odśwież cache dla pojedynczej spółki."""
+    try:
+        print(f"\n{'='*60}")
+        print(f"[SINGLE STOCK UPDATE] Start dla {symbol}")
+        print(f"{'='*60}\n")
+
+        predictor = StockPredictor(symbol, data_dir='stock_data')
+        predictor.fetch_data(use_saved=False)
+
+        if predictor.data is None or len(predictor.data) == 0:
+            return False, f"Nie udało się pobrać danych dla {symbol}"
+
+        predictor.create_features(horizon_days=1)
+        predictor.train_model(horizon_days=1)
+
+        weekly_warning = None
+        if retrain_weekly:
+            try:
+                predictor.train_weekly_model()
+            except Exception as weekly_error:
+                weekly_warning = f"Nie udało się wytrenować modelu tygodniowego: {weekly_error}"
+                print(f"[SINGLE STOCK UPDATE] Ostrzeżenie: {weekly_warning}")
+
+        single_prediction = get_predictions_data(
+            symbols=[symbol],
+            include_all_from_db=False,
+            use_saved_models=True,
+            cache_version=time.time()
+        )
+        if single_prediction:
+            update_all_prediction_caches(single_prediction[0])
+
+        return True, weekly_warning
+    except Exception as e:
+        print(f"[SINGLE STOCK UPDATE] Błąd dla {symbol}: {e}")
+        return False, str(e)
+
+def run_full_daily_update(include_german_stocks=True, all_german_stocks=True):
+    """Uruchom daily_update i zwróć listę wyników."""
+    update_predictor = MultiStockPredictor(excel_file='raport.xlsx')
+    update_predictor.load_symbols_from_excel()
+    
+    if 'custom_tickers' in st.session_state:
+        for ticker in st.session_state.custom_tickers:
+            if ticker not in update_predictor.symbols:
+                update_predictor.symbols.append(ticker)
+    
+    results = update_predictor.daily_update(
+        include_german_stocks=include_german_stocks,
+        all_german_stocks=all_german_stocks
+    )
+    return results
+
+def merge_prediction_lists(primary, secondary):
+    """Zwraca listę predykcji z priorytetem wartości z primary przy duplikatach."""
+    merged = {}
+    secondary = secondary or []
+    for item in secondary:
+        merged[item.get('symbol')] = item
+    for item in primary or []:
+        merged[item.get('symbol')] = item
+    return [p for p in merged.values() if p]
+
+GERMAN_INDEX_TICKERS = [
+    "12DA.DE", "1COV.DE", "1FC.DE", "1SXP.DE", "1YD.DE", "2PP.DE", "AAD.DE", "ABEA.DE",
+    "ADJ.DE", "ADS.DE", "AFX.DE", "AHLA.DE", "AIR.DE", "AIXA.DE", "ALV.DE", "AMD.DE",
+    "APC.DE", "AR4.DE", "ARLN.DE", "AT1.DE", "B4B.DE", "BAS.DE", "BAYN.DE", "BC8.DE",
+    "BEI.DE", "BFSA.DE", "BMT.DE", "BMW3.DE", "BMW.DE", "BNR.DE", "BOSS.DE", "BPE5.DE",
+    "BRYN.DE", "BTCF.DE", "BVB.DE", "CBK.DE", "CEC.DE", "COK.DE", "CON.DE", "DAI.DE",
+    "DB1.DE", "DBK.DE", "DEQ.DE", "DEZ.DE", "DHER.DE", "DHL.DE", "DPW.DE", "DRW3.DE",
+    "DRW8.DE", "DTE.DE", "DTG.DE", "DUE.DE", "DWNI.DE", "EAD.DE", "ECV.DE", "ENR.DE",
+    "EOAN.DE", "EVK.DE", "EVT.DE", "F3C.DE", "FIE.DE", "FME.DE", "FPE3.DE", "FRA.DE",
+    "FRE.DE", "FTK.DE", "G1A.DE", "GBF.DE", "GIL.DE", "GKS.DE", "GXI.DE", "GYC.DE",
+    "HAG.DE", "HDD.DE", "HEI.DE", "HEN3.DE", "HFG.DE", "HLAG.DE", "HNR.DE", "HOT.DE",
+    "HRPK.DE", "HYQ.DE", "HYUD.DE", "IFX.DE", "INS.DE", "JEN.DE", "JST.DE", "JUN3.DE",
+    "KBX.DE", "KCO.DE", "KGX.DE", "KRN.DE", "LEG.DE", "LHA.DE", "LXS.DE", "M0Y.DE",
+    "M0YN.DE", "MBB.DE", "MBG.DE", "MRK.DE", "MSF.DE", "MTX.DE", "MUV2.DE", "NA9.DE",
+    "NDA.DE", "NDX1.DE", "NEM.DE", "NN6.DE", "NOEJ.DE", "NVD.DE", "O2D.DE", "OMV.DE",
+    "P911.DE", "PAH3.DE", "PNE3.DE", "PSM.DE", "PUM.DE", "QIA.DE", "RDC.DE", "RHM.DE",
+    "RIO1.DE", "RRTL.DE", "RWE.DE", "S92.DE", "SAE.DE", "SAP.DE", "SAX.DE", "SBS.DE",
+    "SDF.DE", "SHA.DE", "SHL.DE", "SIE.DE", "SKB.DE", "SMHN.DE", "SRT.DE", "ST5.DE",
+    "SVE.DE", "SY1.DE", "SYAB.DE", "SZG.DE", "SZU.DE", "TEG.DE", "TKA.DE", "TLX.DE",
+    "TMV.DE", "TSLA.DE", "TUI.DE", "UN01.DE", "UTDI.DE", "VBK.DE", "VNA.DE", "VOW1.DE",
+    "VOW3.DE", "VX1.DE", "WAF.DE", "WCH.DE", "WSV2.DE", "WDI.DE", "ZAL.DE", "ZIL2.DE"
+]
 
 @st.cache_data(ttl=3600)
 def get_dax_data():
@@ -284,13 +527,25 @@ def get_dax_data():
         # Utwórz predictor dla DAX
         predictor = StockPredictor('DAX', period='2y', data_dir='stock_data')
         predictor.data = dax_data
-        predictor.create_features()
-        predictor.train_model()
+        predictor.create_features(horizon_days=1)
+        
+        # Spróbuj załadować zapisany model zamiast trenować
+        loaded_model, model_info_dict = predictor.load_model()
+        if loaded_model is not None:
+            predictor.model = loaded_model
+            # Załaduj informacje o modelu
+            model_info = model_info_dict if model_info_dict else {}
+        else:
+            # Brak zapisanego modelu - wytrenuj go od podstaw
+            predictor.train_model(horizon_days=1)
+            loaded_model, model_info_dict = predictor.load_model()
+            predictor.model = loaded_model
+            model_info = model_info_dict if model_info_dict else {}
+        
         prediction = predictor.predict_next_day()
         
-        # Załaduj informacje o modelu
-        model_info = {}
-        if predictor.model_file.exists():
+        # Jeśli model_info jest puste, spróbuj załadować z pliku
+        if not model_info and predictor.model_file.exists():
             with open(predictor.model_file, 'r') as f:
                 model_info = json.load(f)
         
@@ -306,76 +561,23 @@ def get_dax_data():
 
 def get_dax_components():
     """Lista głównych składników DAX"""
-    # Główne spółki DAX (top 10)
-    dax_components = [
-        'SAP.DE', 'SIE.DE', 'ALV.DE', 'MUV2.DE', 'DBK.DE',
-        'BAYN.DE', 'BMW.DE', 'VOW3.DE', 'IFX.DE', 'DTE.DE'
+    # Top 10 według najczęściej śledzonych spółek
+    return [
+        "SAP.DE", "SIE.DE", "ALV.DE", "MUV2.DE", "BAYN.DE",
+        "BMW.DE", "IFX.DE", "DTE.DE", "VOW3.DE", "RWE.DE"
     ]
-    return dax_components
 
 @st.cache_data(ttl=86400)  # Cache na 24 godziny
 def get_all_german_stocks():
     """Lista wszystkich głównych spółek niemieckich"""
-    # DAX 40 (główne spółki)
-    dax_40 = [
-        'SAP.DE', 'SIE.DE', 'ALV.DE', 'MUV2.DE', 'DBK.DE',
-        'BAYN.DE', 'BMW.DE', 'VOW3.DE', 'IFX.DE', 'DTE.DE',
-        'MRK.DE', 'RWE.DE', 'ENR.DE', 'AIR.DE', 'MTX.DE',
-        'FRE.DE', 'HEN3.DE', 'VNA.DE', 'EOAN.DE', 'BAS.DE',
-        'CON.DE', 'SHL.DE', 'ZAL.DE', 'PUM.DE', '1COV.DE',
-        'PAH3.DE', 'HEI.DE', 'QIA.DE', 'RHM.DE', 'SY1.DE',
-        'ADS.DE', 'HNR1.DE', 'BNR.DE', 'DHL.DE', 'MBG.DE',
-        'DHER.DE', 'LIN.DE', 'P911.DE', 'NDX1.DE', 'KCO.DE'
-    ]
-    
-    # MDAX (średnie spółki) - przykładowe
-    mdax = [
-        'ABEA.DE', 'ADN.DE', 'AFX.DE', 'AOX.DE', 'ARL.DE',
-        'AT1.DE', 'BC8.DE', 'BIO3.DE', 'BVB.DE', 'BYW6.DE',
-        'CEC.DE', 'CLS.DE', 'COP.DE', 'DIC.DE', 'DRI.DE',
-        'DUE.DE', 'EVD.DE', 'EVK.DE', 'FNTN.DE', 'G1A.DE',
-        'G24.DE', 'GIL.DE', 'GLJ.DE', 'GXI.DE', 'HLE.DE',
-        'HOT.DE', 'JEN.DE', 'KGX.DE', 'KRN.DE', 'LEG.DE',
-        'LEO.DE', 'LXS.DE', 'M5Z.DE', 'MOR.DE', 'NDA.DE',
-        'NOEJ.DE', 'OSR.DE', 'PFV.DE', 'PSM.DE', 'PUM.DE',
-        'RAA.DE', 'RHM.DE', 'RRTL.DE', 'SAX.DE', 'SBS.DE',
-        'SDF.DE', 'SGL.DE', 'SIX2.DE', 'SKB.DE', 'SNH.DE'
-    ]
-    
-    # SDAX (małe spółki) - przykładowe
-    sdax = [
-        'A1OS.DE', 'ACX.DE', 'ADJ.DE', 'ADL.DE', 'AHC.DE',
-        'AIXA.DE', 'ALT.DE', 'AM3D.DE', 'AOF.DE', 'APM.DE',
-        'ARZ.DE', 'ASL.DE', 'ATN.DE', 'AUR.DE', 'B5A.DE',
-        'B8A.DE', 'B9B.DE', 'BAG.DE', 'BAN.DE', 'BAT.DE',
-        'BAYN.DE', 'BBZA.DE', 'BC8.DE', 'BCO.DE', 'BDF.DE',
-        'BEI.DE', 'BIO3.DE', 'BKS.DE', 'BLH.DE', 'BMW.DE',
-        'BNR.DE', 'BOS.DE', 'BPE5.DE', 'BRM.DE', 'BSL.DE',
-        'BTBB.DE', 'BVB.DE', 'BWO.DE', 'BZR.DE', 'C1V.DE',
-        'CAJ.DE', 'CAP.DE', 'CAR.DE', 'CAS.DE', 'CAT1.DE',
-        'CBK.DE', 'CEC.DE', 'CEC1.DE', 'CEV.DE', 'CFR.DE'
-    ]
-    
-    # TecDAX (spółki technologiczne)
-    tecdax = [
-        'AIXA.DE', 'AM3D.DE', 'BC8.DE', 'BIO3.DE', 'BVB.DE',
-        'CEC.DE', 'DIC.DE', 'DRI.DE', 'EVD.DE', 'EVK.DE',
-        'FNTN.DE', 'G24.DE', 'GIL.DE', 'GXI.DE', 'HLE.DE',
-        'JEN.DE', 'KRN.DE', 'LEG.DE', 'LEO.DE', 'LXS.DE',
-        'M5Z.DE', 'MOR.DE', 'NDA.DE', 'NOEJ.DE', 'OSR.DE',
-        'PFV.DE', 'PSM.DE', 'RAA.DE', 'RRTL.DE', 'SAX.DE'
-    ]
-    
-    # Połącz wszystkie i usuń duplikaty
-    all_stocks = list(set(dax_40 + mdax + sdax + tecdax))
-    all_stocks.sort()
-    
+    all_stocks = sorted(set(GERMAN_INDEX_TICKERS))
+    dax_top = get_dax_components()
     return {
         'all': all_stocks,
-        'dax': dax_40,
-        'mdax': mdax,
-        'sdax': sdax,
-        'tecdax': tecdax
+        'dax': dax_top,
+        'mdax': all_stocks,   # Uproszczenie: wykorzystujemy pełną listę do filtrowania
+        'sdax': all_stocks,
+        'tecdax': all_stocks
     }
 
 def init_favorites():
@@ -673,8 +875,38 @@ def plot_stock_price(predictor, days=60):
     if predictor.features is None or predictor.model is None:
         return None
     
-    # Przewidywania na ostatnich dniach
-    recent_features = predictor.features.iloc[-days:]
+    # Sprawdź jakie cechy model oczekuje (kompatybilność wsteczna)
+    model_expected_features = None
+    if hasattr(predictor.model, 'feature_names_in_'):
+        model_expected_features = list(predictor.model.feature_names_in_)
+    elif hasattr(predictor, 'selected_features') and predictor.selected_features:
+        model_expected_features = predictor.selected_features
+    
+    # Przygotuj features zgodnie z oczekiwaniami modelu
+    if model_expected_features:
+        # Model ma określone cechy - użyj tylko tych
+        available_features = [f for f in model_expected_features if f in predictor.features.columns]
+        
+        if len(available_features) != len(model_expected_features):
+            # Niektóre cechy brakują - spróbuj użyć dostępnych
+            if hasattr(predictor.model, 'feature_names_in_'):
+                # Model sklearn wymaga dokładnego dopasowania
+                recent_features_df = pd.DataFrame(index=predictor.features.index)
+                for feat in model_expected_features:
+                    if feat in predictor.features.columns:
+                        recent_features_df[feat] = predictor.features[feat]
+                    else:
+                        recent_features_df[feat] = 0
+                recent_features_df = recent_features_df[model_expected_features]
+                recent_features = recent_features_df.iloc[-days:]
+            else:
+                recent_features = predictor.features[available_features].iloc[-days:]
+        else:
+            recent_features = predictor.features[model_expected_features].iloc[-days:]
+    else:
+        # Model nie ma określonych cech - użyj wszystkich dostępnych
+        recent_features = predictor.features.iloc[-days:]
+    
     recent_actual_direction = predictor.target.iloc[-days:]  # 0 = DOWN, 1 = UP
     recent_actual_prices = predictor.data['Close'].iloc[-days:]
     recent_predictions = predictor.model.predict(recent_features)
@@ -711,8 +943,26 @@ def plot_stock_price(predictor, days=60):
     last_date = recent_dates[-1]
     next_date = last_date + timedelta(days=1)
     current_price = predictor.data['Close'].iloc[-1]
-    next_direction = predictor.model.predict(predictor.features.iloc[-1:].values)[0]
-    next_proba = predictor.model.predict_proba(predictor.features.iloc[-1:].values)[0, 1]
+    
+    # Użyj odpowiednich cech dla przewidywania
+    if model_expected_features:
+        available_features = [f for f in model_expected_features if f in predictor.features.columns]
+        if len(available_features) != len(model_expected_features) and hasattr(predictor.model, 'feature_names_in_'):
+            last_features_df = pd.DataFrame(index=predictor.features.index[-1:])
+            for feat in model_expected_features:
+                if feat in predictor.features.columns:
+                    last_features_df[feat] = predictor.features[feat].iloc[-1:]
+                else:
+                    last_features_df[feat] = 0
+            last_features_df = last_features_df[model_expected_features]
+            last_features = last_features_df.values
+        else:
+            last_features = predictor.features[model_expected_features].iloc[-1:].values
+    else:
+        last_features = predictor.features.iloc[-1:].values
+    
+    next_direction = predictor.model.predict(last_features)[0]
+    next_proba = predictor.model.predict_proba(last_features)[0, 1]
     
     # Oszacuj cenę na podstawie średniej zmiany historycznej
     historical_changes = predictor.data['Close'].pct_change().dropna()
@@ -807,10 +1057,20 @@ def plot_rsi(predictor, days=60):
     return fig
 
 @st.cache_data(ttl=300)
-def get_intraday_data(symbol, days=7):
-    """Pobierz dane intraday (co minutę) dla ostatnich dni"""
+def get_intraday_data(symbol, days=7, interval=None):
+    """Pobierz dane intraday dla ostatnich dni (automatycznie dobiera interwał).
+    
+    Yahoo Finance udostępnia:
+    - 1m: maks. 7 dni
+    - 5m: maks. 60 dni
+    """
     try:
-        # yfinance pozwala na dane 1m tylko dla ostatnich 7 dni
+        if interval is None:
+            interval = '1m' if days <= 7 else '5m'
+        
+        max_days = 7 if interval == '1m' else 60
+        period_days = min(days, max_days)
+        
         variants = [symbol]
         if '.DE' in symbol:
             base = symbol.replace('.DE', '')
@@ -823,8 +1083,7 @@ def get_intraday_data(symbol, days=7):
         for variant in variants:
             try:
                 ticker = yf.Ticker(variant)
-                # Pobierz dane 1m dla ostatnich dni (max 7 dni)
-                data = ticker.history(period=f"{min(days, 7)}d", interval='1m')
+                data = ticker.history(period=f"{period_days}d", interval=interval)
                 if not data.empty:
                     intraday_data = data
                     break
@@ -840,6 +1099,368 @@ def get_intraday_data(symbol, days=7):
         
         return intraday_data
     except Exception as e:
+        return None
+
+def simulate_future_week(predictor, days=7):
+    """
+    Symuluje przyszły tydzień na podstawie modelu ML i historycznych wzorców
+    
+    Args:
+        predictor: StockPredictor z wytrenowanym modelem
+        days: Liczba dni do symulacji (domyślnie 7)
+    
+    Returns:
+        DataFrame z symulowanymi danymi intraday (co minutę) podobny do get_intraday_data
+    """
+    if predictor.model is None or predictor.data is None or len(predictor.data) == 0:
+        return None
+    
+    try:
+        # Pobierz historyczne wzorce intraday (jeśli dostępne)
+        historical_intraday = get_intraday_data(predictor.symbol, days=7)
+        historical_patterns = None
+        historical_template = None  # Szablon z rzeczywistych danych
+        
+        if historical_intraday is not None and len(historical_intraday) > 0:
+            historical_patterns = analyze_intraday_patterns(historical_intraday)
+            
+            # Użyj ostatniego dnia jako szablonu (jeśli dostępny)
+            historical_filtered = filter_trading_hours(historical_intraday)
+            if historical_filtered is not None and len(historical_filtered) > 0:
+                # Weź ostatni dzień jako szablon
+                last_day = historical_filtered.index[-1].date()
+                last_day_data = historical_filtered[historical_filtered.index.date == last_day]
+                if len(last_day_data) > 10:  # Wystarczająco danych
+                    historical_template = last_day_data.copy()
+        
+        # Oblicz średnie zmiany historyczne
+        historical_changes = predictor.data['Close'].pct_change().dropna()
+        avg_up_change = historical_changes[historical_changes > 0].mean() if len(historical_changes[historical_changes > 0]) > 0 else 0.01
+        avg_down_change = historical_changes[historical_changes < 0].mean() if len(historical_changes[historical_changes < 0]) > 0 else -0.01
+        
+        # Oblicz średnią zmienność (volatility)
+        volatility = historical_changes.std()
+        
+        # Obecna cena
+        current_price = predictor.data['Close'].iloc[-1]
+        
+        # Generuj daty dla przyszłego tygodnia (tylko dni robocze)
+        from datetime import datetime, timedelta
+        simulated_data = []
+        current_date = datetime.now().date()
+        
+        # Generuj minuty dla każdego dnia (tylko godziny handlu: 9:00-17:30)
+        trading_hours = list(range(9, 18))  # 9:00-17:59
+        trading_minutes = [0, 15, 30, 45]  # Co 15 minut dla szybszej symulacji (można zmienić na co minutę)
+        
+        day_count = 0
+        while day_count < days:
+            # Sprawdź czy to dzień roboczy (poniedziałek=0, niedziela=6)
+            if current_date.weekday() < 5:  # Tylko pon-pt
+                # Przewiduj kierunek na ten dzień używając modelu
+                try:
+                    # Użyj ostatnich cech do przewidywania - z pełnym dopasowaniem cech
+                    # Sprawdź jakie cechy model oczekuje (kompatybilność wsteczna)
+                    model_expected_features = None
+                    if hasattr(predictor.model, 'feature_names_in_'):
+                        model_expected_features = list(predictor.model.feature_names_in_)
+                    elif hasattr(predictor, 'selected_features') and predictor.selected_features:
+                        model_expected_features = predictor.selected_features
+                    
+                    # Przygotuj features zgodnie z oczekiwaniami modelu (jak w plot_stock_price)
+                    if model_expected_features:
+                        # Model ma określone cechy - użyj tylko tych
+                        available_features = [f for f in model_expected_features if f in predictor.features.columns]
+                        
+                        if len(available_features) != len(model_expected_features):
+                            # Niektóre cechy brakują - użyj mapowania i wypełnij brakujące
+                            last_features_df = pd.DataFrame(index=predictor.features.index[-1:])
+                            feature_mapping = {
+                                'ATR': 'ATR_log',
+                                'TR': 'TR_log',
+                                'Volume': 'Volume_log'
+                            }
+                            
+                            for feat in model_expected_features:
+                                if feat in predictor.features.columns:
+                                    last_features_df[feat] = predictor.features[feat].iloc[-1:]
+                                elif feat in feature_mapping:
+                                    mapped_feat = feature_mapping[feat]
+                                    if mapped_feat in predictor.features.columns:
+                                        last_features_df[feat] = predictor.features[mapped_feat].iloc[-1:]
+                                    else:
+                                        last_features_df[feat] = 0
+                                else:
+                                    last_features_df[feat] = 0
+                            
+                            last_features_df = last_features_df[model_expected_features]
+                            last_features = last_features_df.values
+                        else:
+                            last_features = predictor.features[model_expected_features].iloc[-1:].values
+                    else:
+                        # Model nie ma określonych cech - użyj wszystkich dostępnych
+                        last_features = predictor.features.iloc[-1:].values
+                    
+                    # Przewiduj kierunek (użyj prawdopodobieństwa zamiast tylko 0/1)
+                    direction_proba = predictor.model.predict_proba(last_features)[0]
+                    up_probability = direction_proba[1] if len(direction_proba) > 1 else 0.5
+                    
+                    # Losuj kierunek na podstawie prawdopodobieństwa
+                    daily_direction = 1 if np.random.random() < up_probability else 0
+                    
+                    # Oblicz oczekiwaną zmianę dzienną
+                    if daily_direction == 1:
+                        expected_daily_change = avg_up_change * up_probability
+                    else:
+                        expected_daily_change = avg_down_change * (1 - up_probability)
+                    
+                    # Ogranicz zmienność dzienną do realistycznych wartości (max 5% dziennie)
+                    max_daily_change = 0.05
+                    daily_change = expected_daily_change + np.random.normal(0, min(volatility * 0.3, 0.02))
+                    daily_change = np.clip(daily_change, -max_daily_change, max_daily_change)
+                    
+                    # Cena otwarcia (może być mały gap, max 1%)
+                    gap_probability = 0.2  # 20% szansy na gap
+                    max_gap = 0.01  # Max 1% gap
+                    if np.random.random() < gap_probability:
+                        gap_size = np.random.normal(0, abs(expected_daily_change) * 0.3)
+                        gap_size = np.clip(gap_size, -max_gap, max_gap)
+                        day_open = current_price * (1 + gap_size)
+                    else:
+                        day_open = current_price
+                    
+                    # Symuluj ruch w ciągu dnia (użyj historycznych wzorców jeśli dostępne)
+                    day_close = day_open * (1 + daily_change)
+                    
+                    # Ogranicz zakres dzienny (High-Low) do max 3% od otwarcia
+                    max_intraday_range = 0.03
+                    day_range = abs(day_close - day_open)
+                    if day_range / day_open > max_intraday_range:
+                        # Skaluj zmianę aby zmieścić się w zakresie
+                        scale = (day_open * max_intraday_range) / day_range
+                        day_close = day_open + (day_close - day_open) * scale
+                    
+                    day_low = min(day_open, day_close) * (1 - max_intraday_range * 0.5)
+                    day_high = max(day_open, day_close) * (1 + max_intraday_range * 0.5)
+                    
+                    # Generuj dane co 15 minut (lub co minutę jeśli potrzeba)
+                    # Jeśli mamy szablon z rzeczywistych danych, użyj go
+                    day_data_points = []
+                    
+                    if historical_template is not None and len(historical_template) > 0:
+                        # Użyj szablonu z rzeczywistych danych - bardziej realistyczne
+                        template_prices = historical_template['Close'].values
+                        template_high = historical_template['High'].values
+                        template_low = historical_template['Low'].values
+                        
+                        # Skaluj szablon do przewidywanego zakresu dnia
+                        template_start_price = template_prices[0]
+                        template_end_price = template_prices[-1]
+                        template_range = template_end_price - template_start_price
+                        
+                        # Oblicz skalę dla nowego dnia
+                        if abs(template_range) > 0.0001:  # Unikaj dzielenia przez zero
+                            scale = (day_close - day_open) / template_range
+                        else:
+                            scale = 1.0
+                        
+                        # Ogranicz skalę do realistycznych wartości
+                        scale = np.clip(scale, 0.5, 2.0)
+                        
+                        # Generuj dane na podstawie szablonu
+                        template_idx = 0
+                        for hour in trading_hours:
+                            for minute in trading_minutes:
+                                timestamp = datetime.combine(current_date, datetime.min.time().replace(hour=hour, minute=minute))
+                                
+                                if template_idx < len(template_prices):
+                                    # Użyj ceny z szablonu, przeskalowanej
+                                    template_price = template_prices[template_idx]
+                                    template_rel_change = (template_price - template_start_price) / template_start_price if template_start_price > 0 else 0
+                                    
+                                    # Zastosuj skalę do zmiany względnej
+                                    price = day_open * (1 + template_rel_change * scale)
+                                    
+                                    # Dodaj mały szum (max 0.1%)
+                                    price_noise = np.random.normal(0, price * 0.001)
+                                    price_noise = np.clip(price_noise, -price * 0.002, price * 0.002)
+                                    price = price + price_noise
+                                    
+                                    # High i Low z szablonu
+                                    template_high_val = template_high[template_idx]
+                                    template_low_val = template_low[template_idx]
+                                    template_high_rel = (template_high_val - template_start_price) / template_start_price if template_start_price > 0 else 0
+                                    template_low_rel = (template_low_val - template_start_price) / template_start_price if template_start_price > 0 else 0
+                                    
+                                    price_high = day_open * (1 + template_high_rel * scale) + abs(price_noise) * 0.5
+                                    price_low = day_open * (1 + template_low_rel * scale) - abs(price_noise) * 0.5
+                                    
+                                    template_idx += 1
+                                else:
+                                    # Jeśli szablon się skończył, użyj interpolacji
+                                    day_progress = ((hour - 9) * 60 + minute) / (8 * 60)
+                                    price = day_open + (day_close - day_open) * day_progress
+                                    price_spread = price * 0.001
+                                    price_high = price + price_spread * 0.5
+                                    price_low = price - price_spread * 0.5
+                                
+                                # Upewnij się, że ceny są w realistycznym zakresie
+                                price = np.clip(price, day_low, day_high)
+                                price_high = max(price, price_high)
+                                price_low = min(price, price_low)
+                                
+                                day_data_points.append({
+                                    'timestamp': timestamp,
+                                    'Open': price,
+                                    'High': price_high,
+                                    'Low': price_low,
+                                    'Close': price,
+                                    'Volume': np.random.lognormal(10, 0.5)
+                                })
+                    else:
+                        # Standardowa symulacja (bez szablonu)
+                        for hour in trading_hours:
+                            for minute in trading_minutes:
+                                timestamp = datetime.combine(current_date, datetime.min.time().replace(hour=hour, minute=minute))
+                                
+                                # Oblicz postęp dnia (0.0 = otwarcie, 1.0 = zamknięcie)
+                                day_progress = ((hour - 9) * 60 + minute) / (8 * 60)  # 8 godzin handlu
+                                day_progress = min(1.0, max(0.0, day_progress))
+                                
+                                # Symuluj cenę w ciągu dnia (użyj bardziej realistycznego wzorca)
+                                # Wzorzec: często dołek rano, szczyt po południu, ale z mniejszymi wahaniami
+                                if historical_patterns and historical_patterns['daily_patterns']:
+                                    # Użyj średniego czasu dołku/szczytu z historii
+                                    try:
+                                        avg_low_hour = int(historical_patterns['avg_low_time'].split(':')[0])
+                                        avg_high_hour = int(historical_patterns['avg_high_time'].split(':')[0])
+                                        
+                                        # Oblicz odległość od typowego dołku/szczytu (bardziej subtelny efekt)
+                                        low_distance = abs(hour - avg_low_hour) / 8.0
+                                        high_distance = abs(hour - avg_high_hour) / 8.0
+                                        
+                                        # Cena bliżej dołku rano, szczytu po południu (mniejszy efekt - max 1%)
+                                        if hour < 12:
+                                            price_factor = 1.0 - low_distance * 0.01  # Max 1% różnica
+                                        else:
+                                            price_factor = 1.0 + high_distance * 0.01  # Max 1% różnica
+                                    except:
+                                        price_factor = 1.0
+                                else:
+                                    # Domyślny wzorzec: dołek rano, szczyt po południu (bardzo subtelny)
+                                    if hour < 12:
+                                        price_factor = 0.995 + (hour - 9) / 3 * 0.005  # Max 0.5% różnica
+                                    else:
+                                        price_factor = 1.0 + (hour - 12) / 5 * 0.005  # Max 0.5% różnica
+                                
+                                # Interpoluj cenę między otwarciem a zamknięciem z uwzględnieniem wzorca
+                                base_price = day_open + (day_close - day_open) * day_progress
+                                
+                                # Dodaj bardzo małe wahania w ciągu dnia (symuluj High/Low)
+                                # Użyj znacznie mniejszej zmienności - max 0.1% na minutę
+                                intraday_volatility = min(volatility * 0.1, 0.001)  # Max 0.1% zmienność
+                                price_noise = np.random.normal(0, intraday_volatility)
+                                price_noise = np.clip(price_noise, -0.002, 0.002)  # Max 0.2% szum
+                                
+                                # Oblicz cenę z uwzględnieniem wzorca i losowości
+                                price = base_price * price_factor * (1 + price_noise)
+                                
+                                # Upewnij się, że cena jest w realistycznym zakresie
+                                price = np.clip(price, day_low, day_high)
+                                
+                                # Aktualizuj Low i High
+                                day_low = min(day_low, price)
+                                day_high = max(day_high, price)
+                                
+                                # Symuluj Open, High, Low, Close dla każdej minuty (bardzo małe różnice)
+                                # High i Low powinny być bardzo blisko Close (max 0.1% różnica)
+                                price_spread = price * 0.001  # Max 0.1% spread
+                                price_high = price + abs(np.random.normal(0, price_spread * 0.5))
+                                price_low = price - abs(np.random.normal(0, price_spread * 0.5))
+                                
+                                # Upewnij się, że High >= Close >= Low
+                                price_high = max(price, price_high)
+                                price_low = min(price, price_low)
+                                
+                                day_data_points.append({
+                                    'timestamp': timestamp,
+                                    'Open': price,
+                                    'High': price_high,
+                                    'Low': price_low,
+                                    'Close': price,
+                                    'Volume': np.random.lognormal(10, 0.5)  # Symuluj wolumen (mniejsza zmienność)
+                                })
+                    
+                    # Upewnij się, że Low i High są poprawne dla całego dnia
+                    # Ale nie zmieniaj zbyt drastycznie - tylko delikatnie dostosuj
+                    for point in day_data_points:
+                        # Delikatnie dostosuj, ale nie więcej niż 0.5%
+                        if point['Low'] < day_low:
+                            point['Low'] = min(point['Low'] * 1.005, day_low)
+                        if point['High'] > day_high:
+                            point['High'] = max(point['High'] * 0.995, day_high)
+                    
+                    # Zaktualizuj cenę zamknięcia ostatniego punktu dnia
+                    if day_data_points:
+                        day_data_points[-1]['Close'] = day_close
+                    
+                    simulated_data.extend(day_data_points)
+                    
+                    # Zaktualizuj cenę dla następnego dnia
+                    current_price = day_close
+                    day_count += 1
+                    
+                except Exception as e:
+                    # Jeśli błąd, użyj prostszej symulacji (ale też z ograniczeniami)
+                    daily_change = np.random.normal(0, min(volatility, 0.02))
+                    daily_change = np.clip(daily_change, -0.05, 0.05)  # Max 5% dziennie
+                    day_open = current_price
+                    day_close = current_price * (1 + daily_change)
+                    
+                    day_data_points = []
+                    for hour in trading_hours:
+                        for minute in trading_minutes:
+                            timestamp = datetime.combine(current_date, datetime.min.time().replace(hour=hour, minute=minute))
+                            day_progress = ((hour - 9) * 60 + minute) / (8 * 60)
+                            price = day_open + (day_close - day_open) * day_progress
+                            
+                            # Bardzo małe wahania
+                            price_spread = price * 0.001
+                            day_data_points.append({
+                                'timestamp': timestamp,
+                                'Open': price,
+                                'High': price + price_spread * 0.5,
+                                'Low': price - price_spread * 0.5,
+                                'Close': price,
+                                'Volume': np.random.lognormal(10, 0.5)
+                            })
+                    
+                    simulated_data.extend(day_data_points)
+                    current_price = day_close
+                    day_count += 1
+            
+            # Przejdź do następnego dnia
+            current_date += timedelta(days=1)
+        
+        if not simulated_data:
+            return None
+        
+        # Utwórz DataFrame z datami - timestamps są już w danych
+        if simulated_data and 'timestamp' in simulated_data[0]:
+            timestamps = [point['timestamp'] for point in simulated_data]
+            data_dict = {key: [point[key] for point in simulated_data] for key in ['Open', 'High', 'Low', 'Close', 'Volume']}
+            df_simulated = pd.DataFrame(data_dict, index=timestamps)
+        else:
+            # Fallback - użyj prostszego podejścia
+            df_simulated = pd.DataFrame(simulated_data)
+            df_simulated.index = pd.date_range(start=datetime.now(), periods=len(simulated_data), freq='15min')
+        
+        return df_simulated
+        
+    except Exception as e:
+        print(f"Błąd przy symulacji przyszłego tygodnia: {e}")
+        import traceback
+        print(traceback.format_exc())
         return None
 
 def filter_trading_hours(intraday_data):
@@ -1204,6 +1825,14 @@ def main():
     init_stock_names()
     init_stock_logos()
     
+    # Inicjalizuj flagi dla DAX - zawsze False przy starcie, aby uniknąć automatycznego ładowania
+    if 'dax_main_data_loaded' not in st.session_state:
+        st.session_state.dax_main_data_loaded = False
+    if 'dax_data_loaded' not in st.session_state:
+        st.session_state.dax_data_loaded = False
+    if 'cache_version' not in st.session_state:
+        st.session_state.cache_version = 0
+    
     # Nagłówek
     st.markdown('<h1 class="main-header">📈 Przewidywanie Cen Akcji</h1>', unsafe_allow_html=True)
     
@@ -1226,19 +1855,17 @@ def main():
                 
                 def run_update_in_thread():
                     try:
-                        update_predictor = MultiStockPredictor(excel_file='raport.xlsx')
-                        symbols_dict = update_predictor.load_symbols_from_excel()
-                        
-                        if 'custom_tickers' in st.session_state:
-                            for ticker in st.session_state.custom_tickers:
-                                if ticker not in update_predictor.symbols:
-                                    update_predictor.symbols.append(ticker)
-                        
-                        results = update_predictor.daily_update(include_german_stocks=True, all_german_stocks=True)
+                        print("[DAILY UPDATE][THREAD] Start")
+                        results = run_full_daily_update(include_german_stocks=True, all_german_stocks=True)
+                        print("[DAILY UPDATE][THREAD] Zakończono")
                         st.session_state.update_results = results
                         st.session_state.update_running = False
                         st.session_state.update_progress = f"✓ Zakończono! Zaktualizowano {len(results)} spółek"
                         st.session_state.update_completed = True  # Flaga do powiadomienia
+                        # Zwiększ wersję cache, aby wymusić odświeżenie danych po zakończeniu Daily Update
+                        if 'cache_version' not in st.session_state:
+                            st.session_state.cache_version = 0
+                        st.session_state.cache_version += 1
                     except Exception as e:
                         st.session_state.update_error = str(e)
                         st.session_state.update_running = False
@@ -1256,17 +1883,28 @@ def main():
             elapsed = datetime.now() - start_time
             st.info(f"🔄 Aktualizacja w toku... (czas: {elapsed.seconds}s)")
             st.caption("Możesz kontynuować korzystanie z aplikacji - używa ostatnich zapisanych danych")
+        elif st.button("📥 Pobierz dane z Yahoo teraz (blokuje UI)", width='stretch'):
+            with st.spinner("Pobieranie danych i trenowanie modeli..."):
+                try:
+                    results = run_full_daily_update(include_german_stocks=True, all_german_stocks=True)
+                    st.session_state.update_results = results
+                    st.session_state.update_completed = True
+                    st.session_state.update_running = False
+                    st.session_state.update_progress = f"✓ Zakończono! Zaktualizowano {len(results)} spółek"
+                    st.session_state.update_error = None
+                    st.session_state.cache_version = st.session_state.get('cache_version', 0) + 1
+                    st.success(f"✅ Aktualizacja zakończona! ({len(results)} spółek)")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"✗ Błąd podczas ręcznej aktualizacji: {e}")
+                    st.session_state.update_error = str(e)
+                    st.session_state.update_running = False
             
-            # Przycisk do sprawdzenia statusu
-            if st.button("🔄 Sprawdź status i odśwież", width='stretch'):
-                st.cache_data.clear()
-                st.rerun()
-        
         # Powiadomienie o zakończeniu aktualizacji
         if st.session_state.get('update_completed', False) and st.session_state.get('update_results') is not None:
             results = st.session_state.update_results
             if results:
-                st.success(f"✅ Aktualizacja zakończona! Zaktualizowano {len(results)} spółek. Odśwież stronę aby zobaczyć nowe dane.")
+                st.success(f"✅ Aktualizacja zakończona! Zaktualizowano {len(results)} spółek. Dane zostały automatycznie odświeżone.")
                 with st.expander(f"📊 Wyniki aktualizacji ({len(results)} spółek)", expanded=False):
                     df_summary = pd.DataFrame([
                         {
@@ -1284,17 +1922,11 @@ def main():
                     if len(results) > 20:
                         st.caption(f"... i {len(results) - 20} więcej spółek")
                 
-                # Przycisk do odświeżenia danych
-                if st.button("🔄 Odśwież dane i zamknij powiadomienie", key="refresh_after_update", width='stretch'):
-                    st.cache_data.clear()
+                # Przycisk do zamknięcia powiadomienia
+                if st.button("✖️ Zamknij powiadomienie", key="close_notification", width='stretch'):
                     st.session_state.update_results = None
                     st.session_state.update_completed = False
                     st.rerun()
-        
-        # Opcje odświeżania
-        if st.button("🔄 Odśwież dane", width='stretch'):
-            st.cache_data.clear()
-            st.rerun()
         
         st.divider()
         
@@ -1347,15 +1979,7 @@ def main():
                 placeholder="np. AAPL, MSFT, TSLA",
                 help="Wpisz symbol tickera (np. AAPL dla Apple, TSLA dla Tesla)"
             )
-            col1, col2 = st.columns(2)
-            with col1:
-                submitted = st.form_submit_button("➕ Dodaj", width='stretch')
-            with col2:
-                refresh_clicked = st.form_submit_button("🔄 Odśwież", width='stretch')
-        
-        if refresh_clicked:
-            st.cache_data.clear()
-            st.rerun()
+            submitted = st.form_submit_button("➕ Dodaj", width='stretch')
         
         if submitted and new_ticker:
             ticker_upper = new_ticker.strip().upper()
@@ -1365,7 +1989,7 @@ def main():
                     with st.spinner(f"Pobieranie nazwy dla {ticker_upper}..."):
                         stock_name = get_stock_name(ticker_upper)
                     st.success(f"✓ Dodano ticker: {ticker_upper} ({stock_name})")
-                    st.cache_data.clear()
+                    st.info("💡 Uruchom '🚀 Uruchom Daily Update' aby pobrać dane dla nowego tickera.")
                     st.rerun()
                 else:
                     st.warning(f"Ticker {ticker_upper} już istnieje lub jest nieprawidłowy")
@@ -1384,13 +2008,11 @@ def main():
                 with col2:
                     if st.button("🗑️", key=f"remove_{ticker}", help=f"Usuń {ticker}"):
                         remove_custom_ticker(ticker)
-                        st.cache_data.clear()
                         st.rerun()
             
             if st.button("🗑️ Usuń wszystkie", use_container_width=True):
                 st.session_state.custom_tickers = []
                 save_custom_tickers()
-                st.cache_data.clear()
                 st.rerun()
         else:
             st.caption("Brak własnych tickerów")
@@ -1412,8 +2034,7 @@ def main():
         return
     
     # Pobierz dane przewidywań - używaj zapisanych modeli (szybkie, nie blokuje UI)
-    # Usuń spinner - dane ładują się szybko z zapisanych modeli
-    predictions_data = get_predictions_data(symbols, include_all_from_db=False, use_saved_models=True)
+    predictions_data = get_dashboard_predictions(symbols, include_all_from_db=False)
     
     if not predictions_data:
         st.warning("Brak danych do wyświetlenia. Kliknij '🚀 Uruchom Daily Update' aby pobrać dane.")
@@ -1424,7 +2045,12 @@ def main():
     closed_predictions = [p for p in predictions_data if p['symbol'] in closed_symbols]
     
     # Tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "📈 Szczegóły spółki", "📋 Wszystkie spółki", "📉 Statystyki", "🇩🇪 Indeks DAX"])
+    tab_labels = ["📊 Dashboard", "📈 Szczegóły spółki", "📋 Wszystkie spółki", "📉 Statystyki", "🇩🇪 Indeks DAX", "📊 Skuteczność predykcji"]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(tab_labels)
+    
+    if st.session_state.get('switch_tab_to'):
+        tab_to_switch = st.session_state.pop('switch_tab_to')
+        trigger_tab_switch(tab_to_switch)
     
     with tab1:
         st.header("Dashboard - Przegląd wszystkich spółek")
@@ -1448,28 +2074,61 @@ def main():
         
         st.divider()
         
-        # Sekcja ulubionych
-        if st.session_state.favorites:
-            st.subheader(f"⭐ Ulubione ({len(st.session_state.favorites)})")
+        favorites_list = list(st.session_state.get('favorites', []))
+        favorite_predictions = []
+        favorites_without_data = []
+        
+        if favorites_list:
+            st.subheader(f"⭐ Ulubione ({len(favorites_list)})")
             
-            # Użyj już załadowanych danych z predictions_data (szybkie, nie blokuje)
-            # Jeśli brakuje jakichś ulubionych, spróbuj pobrać z bazy (ale nie blokuj UI)
-            favorite_predictions = [p for p in predictions_data if p['symbol'] in st.session_state.favorites]
+            predictions_map = {p['symbol']: p for p in predictions_data}
+            missing_favorites = []
             
-            # Sprawdź czy są ulubione bez danych w predictions_data
-            missing_favorites = [fav for fav in st.session_state.favorites if not any(p['symbol'] == fav for p in predictions_data)]
+            for symbol in favorites_list:
+                prediction = predictions_map.get(symbol)
+                if prediction:
+                    favorite_predictions.append(prediction)
+                else:
+                    missing_favorites.append(symbol)
             
-            # Jeśli są brakujące, spróbuj pobrać je w tle (ale nie czekaj)
+            remaining_missing = []
             if missing_favorites:
-                # Pobierz tylko brakujące symbole (szybciej)
                 try:
-                    missing_predictions = get_predictions_data(missing_favorites, include_all_from_db=False, use_saved_models=True)
-                    favorite_predictions.extend(missing_predictions)
-                except:
-                    pass  # Jeśli nie uda się pobrać, pokaż tylko to co mamy
+                    cache_version = st.session_state.get('cache_version', 0)
+                    missing_predictions = get_predictions_data(
+                        symbols=missing_favorites,
+                        include_all_from_db=False,
+                        use_saved_models=True,
+                        cache_version=cache_version
+                    )
+                    missing_map = {p['symbol']: p for p in missing_predictions}
+                    for symbol in missing_favorites:
+                        if symbol in missing_map:
+                            favorite_predictions.append(missing_map[symbol])
+                        else:
+                            remaining_missing.append(symbol)
+                except Exception:
+                    remaining_missing = list(missing_favorites)
+            else:
+                remaining_missing = []
+            
+            if remaining_missing:
+                try:
+                    dax_predictions = get_dax_predictions(include_all_from_db=True)
+                    dax_map = {p['symbol']: p for p in dax_predictions}
+                    resolved = []
+                    for symbol in remaining_missing:
+                        prediction = dax_map.get(symbol)
+                        if prediction:
+                            favorite_predictions.append(prediction)
+                            resolved.append(symbol)
+                    remaining_missing = [s for s in remaining_missing if s not in resolved]
+                except Exception:
+                    pass
+            
+            favorites_without_data = remaining_missing
             
             if favorite_predictions:
-                # Wybierz okres do wyświetlenia dla ulubionych
                 period_option_fav = st.radio(
                     "Wybierz okres przewidywania:",
                     ["1 dzień", "1 tydzień", "1 miesiąc", "6 miesięcy"],
@@ -1483,189 +2142,304 @@ def main():
                     "1 miesiąc": "prediction_month",
                     "6 miesięcy": "prediction_6months"
                 }
-                
                 selected_period_fav = period_map_fav[period_option_fav]
                 
                 df_fav_data = []
+                change_values_fav = []
                 for p in favorite_predictions:
-                    if selected_period_fav and selected_period_fav in p:
-                        pred = p[selected_period_fav]
-                        df_fav_data.append({
-                            'Symbol': p['symbol'],
-                            'Nazwa spółki': get_stock_name(p['symbol']),
-                            'Kierunek': pred.get('predicted_direction', 'N/A'),
-                            'Prawdopod.': f"{pred.get('direction_probability', 0)*100:.1f}%",
-                            'Aktualna cena': f"${p['current_price']:.2f}",
-                            'Przewidywana cena': f"${pred['predicted_price']:.2f}",
-                            'Zmiana': f"${pred['change']:.2f}",
-                            'Zmiana %': f"{pred['change_percent']:.2f}%",
-                            'Dokładność': f"{p.get('test_accuracy', 0):.2%}" if p.get('test_accuracy', 0) > 0 else "N/A"
-                        })
-                    else:
-                        df_fav_data.append({
-                            'Symbol': p['symbol'],
-                            'Nazwa spółki': get_stock_name(p['symbol']),
-                            'Kierunek': p.get('predicted_direction', 'N/A'),
-                            'Prawdopod.': f"{p.get('direction_probability', 0)*100:.1f}%",
-                            'Aktualna cena': f"${p['current_price']:.2f}",
-                            'Przewidywana cena': f"${p['predicted_price']:.2f}",
-                            'Zmiana': f"${p['change']:.2f}",
-                            'Zmiana %': f"{p['change_percent']:.2f}%",
-                            'Dokładność': f"{p.get('test_accuracy', 0):.2%}" if p.get('test_accuracy', 0) > 0 else "N/A"
-                        })
+                    source_pred = p.get(selected_period_fav) if (selected_period_fav and selected_period_fav in p) else p
+                    change_val = source_pred.get('change_percent', p.get('change_percent', 0))
+                    change_values_fav.append(change_val)
+                    df_fav_data.append({
+                        'Symbol': p['symbol'],
+                        'Nazwa spółki': get_stock_name(p['symbol']),
+                        'Kierunek': source_pred.get('predicted_direction', 'N/A'),
+                        'Prawdopod.': f"{source_pred.get('direction_probability', 0)*100:.1f}%",
+                        'Aktualna cena': source_pred.get('current_price', p.get('current_price', 0)),
+                        'Przewidywana cena': source_pred.get('predicted_price', source_pred.get('current_price', p.get('current_price', 0))),
+                        'Zmiana': source_pred.get('change', p.get('change', 0)),
+                        'Zmiana %': change_val,
+                        'Dokładność': p.get('test_accuracy', 0)
+                    })
                 
                 df_fav = pd.DataFrame(df_fav_data)
-                
-                # Sortuj według zmiany procentowej
-                if selected_period_fav and selected_period_fav in favorite_predictions[0] if favorite_predictions else False:
-                    change_values_fav = [p[selected_period_fav]['change_percent'] for p in favorite_predictions]
-                else:
-                    change_values_fav = [p['change_percent'] for p in favorite_predictions]
-                
                 df_fav['Zmiana_num'] = change_values_fav
                 df_fav = df_fav.sort_values('Zmiana_num', ascending=False)
-                df_fav = df_fav.drop('Zmiana_num', axis=1)
                 
-                df_fav = clean_dataframe_for_streamlit(df_fav)
-                st.dataframe(df_fav, width='stretch', hide_index=True)
+                table_cols = [
+                    'Symbol', 'Nazwa spółki', 'Kierunek', 'Prawdopod.',
+                    'Aktualna cena', 'Przewidywana cena', 'Zmiana',
+                    'Zmiana %', 'Dokładność'
+                ]
+                df_fav_display = df_fav[table_cols].copy()
+                df_fav_display['Aktualna cena'] = df_fav_display['Aktualna cena'].apply(lambda x: f"${x:.2f}")
+                df_fav_display['Przewidywana cena'] = df_fav_display['Przewidywana cena'].apply(lambda x: f"${x:.2f}")
+                df_fav_display['Zmiana'] = df_fav_display['Zmiana'].apply(lambda x: f"${x:.2f}")
+                df_fav_display['Zmiana %'] = df_fav_display['Zmiana %'].apply(lambda x: f"{x:.2f}%")
+                df_fav_display['Dokładność'] = df_fav_display['Dokładność'].apply(lambda x: f"{x:.2%}" if x > 0 else "N/A")
+                df_fav_display = clean_dataframe_for_streamlit(df_fav_display)
+                
+                config = {
+                    'Symbol': st.column_config.Column(width='small'),
+                    'Nazwa spółki': st.column_config.Column(width='medium'),
+                    'Kierunek': st.column_config.Column(width='small'),
+                    'Prawdopod.': st.column_config.Column(width='small'),
+                    'Aktualna cena': st.column_config.Column(width='small'),
+                    'Przewidywana cena': st.column_config.Column(width='small'),
+                    'Zmiana': st.column_config.Column(width='small'),
+                    'Zmiana %': st.column_config.Column(width='small'),
+                    'Dokładność': st.column_config.Column(width='small')
+                }
+                
+                st.dataframe(
+                    df_fav_display,
+                    hide_index=True,
+                    use_container_width=True,
+                    height=min(400, 60 + 28 * len(df_fav_display)),
+                    column_config=config
+                )
+                
+                action_cols = st.columns(2)
+                with action_cols[0]:
+                    selected_fav_symbol = st.selectbox(
+                        "Szybkie akcje dla ulubionej spółki:",
+                        df_fav_display['Symbol'],
+                        key="fav_quick_select"
+                    )
+                    selected_fav_name = get_stock_name(selected_fav_symbol)
+                with action_cols[1]:
+                    st.markdown(f"**{selected_fav_name}**")
+                
+                quick_cols = st.columns(2)
+                with quick_cols[0]:
+                    if st.button("📈 Szczegóły (ulubione)", key="fav_quick_details"):
+                        navigate_to_details(selected_fav_symbol)
+                with quick_cols[1]:
+                    if st.button("🗑️ Usuń z ulubionych", key="fav_quick_remove"):
+                        toggle_favorite(selected_fav_symbol)
+                        st.rerun()
             else:
                 st.info("Brak danych dla ulubionych spółek. Uruchom najpierw Daily Update.")
             
-            st.divider()
+            if favorites_without_data:
+                missing_str = ", ".join(sorted(favorites_without_data))
+                st.caption(f"Brak zapisanych danych dla: {missing_str}. Uruchom aktualizację dla tych spółek.")
+        else:
+            st.info("Brak ulubionych spółek. Dodaj je w sekcjach poniżej.")
+
+        try:
+            all_saved_predictions = get_dax_predictions(include_all_from_db=True)
+        except Exception:
+            all_saved_predictions = []
+        combined_predictions = merge_prediction_lists(predictions_data, all_saved_predictions)
+
+        top_panels = st.columns(1)
         
-        # Tabela dla otwartych pozycji
-        if open_predictions:
-            st.subheader("🟢 Otwarte pozycje")
+        with top_panels[0]:
+            st.subheader("📊 Metryki ogólne")
+            col_a, col_b, col_c = st.columns(3)
+            total_stocks = len(predictions_data)
+            avg_change = np.mean([p['change_percent'] for p in predictions_data]) if predictions_data else 0
+            up_predictions = sum(1 for p in predictions_data if p.get('predicted_direction') == 'UP')
             
-            # Wybierz okres do wyświetlenia
-            period_option = st.radio(
-                "Wybierz okres przewidywania:",
-                ["1 dzień", "1 tydzień", "1 miesiąc", "6 miesięcy"],
-                horizontal=True,
-                key="open_period"
-            )
+            col_a.metric("Liczba spółek", total_stocks)
+            col_b.metric("Średnia zmiana (%)", f"{avg_change:.2f}%")
+            if total_stocks > 0:
+                col_c.metric("Przewidywania UP", f"{up_predictions}/{total_stocks}")
+            else:
+                col_c.metric("Przewidywania UP", "0/0")
             
-            period_map = {
-                "1 dzień": None,  # Domyślne przewidywanie
-                "1 tydzień": "prediction_week",
-                "1 miesiąc": "prediction_month",
-                "6 miesięcy": "prediction_6months"
-            }
-            
-            selected_period = period_map[period_option]
-            
-            df_open_data = []
-            for p in open_predictions:
-                if selected_period and selected_period in p:
-                    pred = p[selected_period]
-                    df_open_data.append({
+            if favorite_predictions:
+                st.caption(f"Ulubione ({len(favorite_predictions)})")
+                fav_preview = pd.DataFrame([
+                    {
                         'Symbol': p['symbol'],
-                        'Nazwa spółki': get_stock_name(p['symbol']),
-                        'Kierunek': pred.get('predicted_direction', 'N/A'),
-                        'Prawdopod.': f"{pred.get('direction_probability', 0)*100:.1f}%",
-                        'Aktualna cena': f"${p['current_price']:.2f}",
-                        'Przewidywana cena': f"${pred['predicted_price']:.2f}",
-                        'Zmiana': f"${pred['change']:.2f}",
-                        'Zmiana %': f"{pred['change_percent']:.2f}%",
-                        'Dokładność': f"{p.get('test_accuracy', 0):.2%}" if p.get('test_accuracy', 0) > 0 else "N/A"
-                    })
-                else:
-                    df_open_data.append({
-                        'Symbol': p['symbol'],
-                        'Nazwa spółki': get_stock_name(p['symbol']),
                         'Kierunek': p.get('predicted_direction', 'N/A'),
                         'Prawdopod.': f"{p.get('direction_probability', 0)*100:.1f}%",
-                        'Aktualna cena': f"${p['current_price']:.2f}",
-                        'Przewidywana cena': f"${p['predicted_price']:.2f}",
-                        'Zmiana': f"${p['change']:.2f}",
-                        'Zmiana %': f"{p['change_percent']:.2f}%",
-                        'Dokładność': f"{p.get('test_accuracy', 0):.2%}" if p.get('test_accuracy', 0) > 0 else "N/A"
-                    })
-            
-            df_open = pd.DataFrame(df_open_data)
-            
-            # Sortuj według zmiany procentowej (z wybranego okresu)
-            if selected_period and selected_period in open_predictions[0] if open_predictions else False:
-                change_values = [p[selected_period]['change_percent'] for p in open_predictions]
+                        'Zmiana %': f"{p['change_percent']:.2f}%"
+                    }
+                    for p in favorite_predictions[:5]
+                ])
+                fav_preview = clean_dataframe_for_streamlit(fav_preview)
+                st.dataframe(fav_preview, hide_index=True, use_container_width=True)
             else:
-                change_values = [p['change_percent'] for p in open_predictions]
-            
-            df_open['Zmiana_num'] = change_values
-            df_open = df_open.sort_values('Zmiana_num', ascending=False)
-            df_open = df_open.drop('Zmiana_num', axis=1)
-            
-            df_open = clean_dataframe_for_streamlit(df_open)
-            st.dataframe(df_open, width='stretch', hide_index=True)
-        else:
-            st.info("Brak otwartych pozycji")
+                st.caption("Brak ulubionych spółek")
+        
+        st.subheader("📈 Trendy i pewność")
+        trend_cols = st.columns(2)
+
+        with trend_cols[0]:
+            st.caption("Top 10 tygodniowych zmian")
+            top_week_rows = []
+            for p in combined_predictions:
+                week_pred = p.get('prediction_week')
+                if week_pred:
+                    top_week_rows.append({
+                        'Symbol': p['symbol'],
+                        'Kierunek': week_pred.get('predicted_direction', 'N/A'),
+                        'Prawdopod.': week_pred.get('direction_probability', 0),
+                        'Zmiana % (7d)': week_pred['change_percent']
+                    })
+            if top_week_rows:
+                top_week_df = pd.DataFrame(top_week_rows)
+                top_week_df = top_week_df.sort_values('Zmiana % (7d)', ascending=False).head(10)
+                top_week_df['Prawdopod.'] = top_week_df['Prawdopod.'].apply(lambda x: f"{x*100:.1f}%")
+                top_week_df['Zmiana % (7d)'] = top_week_df['Zmiana % (7d)'].apply(lambda x: f"{x:.2f}%")
+                top_week_df = clean_dataframe_for_streamlit(top_week_df)
+                st.dataframe(top_week_df, hide_index=True, use_container_width=True)
+            else:
+                st.caption("Brak predykcji tygodniowych do wyświetlenia.")
+
+        with trend_cols[1]:
+            st.caption("Top 20 najwyższej pewności (tylko dodatnie zmiany)")
+            confidence_rows = []
+            for p in combined_predictions:
+                change_pct = p.get('change_percent', 0)
+                if change_pct is None or change_pct <= 0:
+                    continue
+                confidence_rows.append({
+                    'Symbol': p['symbol'],
+                    'Kierunek': p.get('predicted_direction', 'N/A'),
+                    'Prawdopod.': p.get('direction_probability', 0),
+                    'Zmiana % (1d)': change_pct
+                })
+            if confidence_rows:
+                conf_df = pd.DataFrame(confidence_rows)
+                conf_df = conf_df.sort_values('Prawdopod.', ascending=False).head(20)
+                conf_df['Prawdopod.'] = conf_df['Prawdopod.'].apply(lambda x: f"{x*100:.1f}%")
+                conf_df['Zmiana % (1d)'] = conf_df['Zmiana % (1d)'].apply(lambda x: f"{x:.2f}%")
+                conf_df = clean_dataframe_for_streamlit(conf_df)
+                st.dataframe(conf_df, hide_index=True, use_container_width=True)
+            else:
+                st.caption("Brak spółek z dodatnimi zmianami i wysoką pewnością.")
         
         st.divider()
         
-        # Tabela dla historycznych pozycji
-        if closed_predictions:
-            st.subheader("🔴 Historyczne pozycje")
-            
-            # Wybierz okres do wyświetlenia
-            period_option_closed = st.radio(
-                "Wybierz okres przewidywania:",
-                ["1 dzień", "1 tydzień", "1 miesiąc", "6 miesięcy"],
-                horizontal=True,
-                key="closed_period"
-            )
-            
-            period_map = {
-                "1 dzień": None,  # Domyślne przewidywanie
-                "1 tydzień": "prediction_week",
-                "1 miesiąc": "prediction_month",
-                "6 miesięcy": "prediction_6months"
-            }
-            
-            selected_period = period_map[period_option_closed]
-            
-            df_closed_data = []
-            for p in closed_predictions:
-                if selected_period and selected_period in p:
-                    pred = p[selected_period]
-                    df_closed_data.append({
+        open_col, closed_col = st.columns(2)
+        
+        with open_col:
+            if open_predictions:
+                st.subheader("🟢 Otwarte pozycje")
+                
+                period_option = st.radio(
+                    "Wybierz okres przewidywania:",
+                    ["1 dzień", "1 tydzień", "1 miesiąc", "6 miesięcy"],
+                    horizontal=True,
+                    key="open_period"
+                )
+                
+                period_map = {
+                    "1 dzień": None,
+                    "1 tydzień": "prediction_week",
+                    "1 miesiąc": "prediction_month",
+                    "6 miesięcy": "prediction_6months"
+                }
+                selected_period = period_map[period_option]
+                
+                df_open_data = []
+                for p in open_predictions:
+                    source_pred = p.get(selected_period) if (selected_period and selected_period in p) else p
+                    df_open_data.append({
                         'Symbol': p['symbol'],
                         'Nazwa spółki': get_stock_name(p['symbol']),
-                        'Kierunek': pred.get('predicted_direction', 'N/A'),
-                        'Prawdopod.': f"{pred.get('direction_probability', 0)*100:.1f}%",
+                        'Kierunek': source_pred.get('predicted_direction', 'N/A'),
+                        'Prawdopod.': f"{source_pred.get('direction_probability', 0)*100:.1f}%",
                         'Aktualna cena': f"${p['current_price']:.2f}",
-                        'Przewidywana cena': f"${pred['predicted_price']:.2f}",
-                        'Zmiana': f"${pred['change']:.2f}",
-                        'Zmiana %': f"{pred['change_percent']:.2f}%",
+                        'Przewidywana cena': f"${source_pred.get('predicted_price', p['predicted_price']):.2f}",
+                        'Zmiana': f"${source_pred.get('change', p['change']):.2f}",
+                        'Zmiana %': source_pred.get('change_percent', p['change_percent']),
                         'Dokładność': f"{p.get('test_accuracy', 0):.2%}" if p.get('test_accuracy', 0) > 0 else "N/A"
                     })
-                else:
-                    df_closed_data.append({
-                        'Symbol': p['symbol'],
-                        'Nazwa spółki': get_stock_name(p['symbol']),
-                        'Kierunek': p.get('predicted_direction', 'N/A'),
-                        'Prawdopod.': f"{p.get('direction_probability', 0)*100:.1f}%",
-                        'Aktualna cena': f"${p['current_price']:.2f}",
-                        'Przewidywana cena': f"${p['predicted_price']:.2f}",
-                        'Zmiana': f"${p['change']:.2f}",
-                        'Zmiana %': f"{p['change_percent']:.2f}%",
-                        'Dokładność': f"{p.get('test_accuracy', 0):.2%}" if p.get('test_accuracy', 0) > 0 else "N/A"
-                    })
-            
-            df_closed = pd.DataFrame(df_closed_data)
-            
-            # Sortuj według zmiany procentowej (z wybranego okresu)
-            if selected_period and selected_period in closed_predictions[0] if closed_predictions else False:
-                change_values = [p[selected_period]['change_percent'] for p in closed_predictions]
+                
+                df_open = pd.DataFrame(df_open_data)
+                change_values = [row['Zmiana %'] for row in df_open_data]
+                df_open['Zmiana_num'] = change_values
+                df_open = df_open.sort_values('Zmiana_num', ascending=False)
+                df_open = df_open.drop('Zmiana_num', axis=1)
+                df_open_display = df_open.copy()
+                df_open_display['Zmiana %'] = df_open_display['Zmiana %'].apply(lambda x: f"{x:.2f}%")
+                df_open_display = clean_dataframe_for_streamlit(df_open_display)
+                
+                table_height = min(420, 120 + len(df_open_display) * 28)
+                st.dataframe(df_open_display, hide_index=True, use_container_width=True, height=table_height)
+                
+                selected_open_symbol = st.selectbox("Wybierz spółkę do szczegółów:", df_open['Symbol'], key="open_details_select")
+                if st.button("📈 Przejdź do szczegółów", key="open_details_btn"):
+                    navigate_to_details(selected_open_symbol)
+                
+                fav_cols = st.columns([3, 1])
+                with fav_cols[0]:
+                    open_fav_symbol = st.selectbox("Dodaj do ulubionych:", df_open['Symbol'], key="open_fav_select")
+                with fav_cols[1]:
+                    if st.button("⭐ Dodaj", key="open_fav_btn"):
+                        toggle_favorite(open_fav_symbol)
+                        st.success(f"Dodano {open_fav_symbol} do ulubionych")
+                        st.rerun()
             else:
-                change_values = [p['change_percent'] for p in closed_predictions]
+                st.subheader("🟢 Otwarte pozycje")
+                st.info("Brak otwartych pozycji")
             
-            df_closed['Zmiana_num'] = change_values
-            df_closed = df_closed.sort_values('Zmiana_num', ascending=False)
-            df_closed = df_closed.drop('Zmiana_num', axis=1)
-            
-            df_closed = clean_dataframe_for_streamlit(df_closed)
-            st.dataframe(df_closed, width='stretch', hide_index=True)
-        else:
-            st.info("Brak historycznych pozycji")
+        with closed_col:
+            if closed_predictions:
+                st.subheader("🔴 Historyczne pozycje")
+                
+                period_option_closed = st.radio(
+                    "Wybierz okres przewidywania:",
+                    ["1 dzień", "1 tydzień", "1 miesiąc", "6 miesięcy"],
+                    horizontal=True,
+                    key="closed_period"
+                )
+                
+                period_map = {
+                    "1 dzień": None,
+                    "1 tydzień": "prediction_week",
+                    "1 miesiąc": "prediction_month",
+                    "6 miesięcy": "prediction_6months"
+                }
+                selected_period = period_map[period_option_closed]
+                
+                df_closed_data = []
+                for p in closed_predictions:
+                    source_pred = p.get(selected_period) if (selected_period and selected_period in p) else p
+                    df_closed_data.append({
+                        'Symbol': p['symbol'],
+                        'Nazwa spółki': get_stock_name(p['symbol']),
+                        'Kierunek': source_pred.get('predicted_direction', 'N/A'),
+                        'Prawdopod.': f"{source_pred.get('direction_probability', 0)*100:.1f}%",
+                        'Aktualna cena': f"${p['current_price']:.2f}",
+                        'Przewidywana cena': f"${source_pred.get('predicted_price', p['predicted_price']):.2f}",
+                        'Zmiana': f"${source_pred.get('change', p['change']):.2f}",
+                        'Zmiana %': source_pred.get('change_percent', p['change_percent']),
+                        'Dokładność': f"{p.get('test_accuracy', 0):.2%}" if p.get('test_accuracy', 0) > 0 else "N/A"
+                    })
+                
+                df_closed = pd.DataFrame(df_closed_data)
+                change_values = [row['Zmiana %'] for row in df_closed_data]
+                df_closed['Zmiana_num'] = change_values
+                df_closed = df_closed.sort_values('Zmiana_num', ascending=False)
+                df_closed = df_closed.drop('Zmiana_num', axis=1)
+                df_closed_display = df_closed.copy()
+                df_closed_display['Zmiana %'] = df_closed_display['Zmiana %'].apply(lambda x: f"{x:.2f}%")
+                df_closed_display = clean_dataframe_for_streamlit(df_closed_display)
+                
+                table_height = min(420, 120 + len(df_closed_display) * 28)
+                st.dataframe(df_closed_display, hide_index=True, use_container_width=True, height=table_height)
+                
+                selected_closed_symbol = st.selectbox("Wybierz spółkę do szczegółów:", df_closed['Symbol'], key="closed_details_select")
+                if st.button("📈 Przejdź do szczegółów (historyczne)", key="closed_details_btn"):
+                    navigate_to_details(selected_closed_symbol)
+                
+                fav_closed_cols = st.columns([3, 1])
+                with fav_closed_cols[0]:
+                    closed_fav_symbol = st.selectbox("Dodaj do ulubionych (historyczne):", df_closed['Symbol'], key="closed_fav_select")
+                with fav_closed_cols[1]:
+                    if st.button("⭐ Dodaj (hist.)", key="closed_fav_btn"):
+                        toggle_favorite(closed_fav_symbol)
+                        st.success(f"Dodano {closed_fav_symbol} do ulubionych")
+                        st.rerun()
+            else:
+                st.subheader("🔴 Historyczne pozycje")
+                st.info("Brak historycznych pozycji")
         
         # Wykres zmian procentowych
         fig_changes = go.Figure()
@@ -1694,27 +2468,52 @@ def main():
             showlegend=False
         )
         
-        st.plotly_chart(fig_changes, width='stretch')
+        st.plotly_chart(fig_changes, use_container_width=True)
     
     with tab2:
+        # Użyj selected_symbol z session_state jeśli jest ustawione, w przeciwnym razie użyj lokalnej zmiennej
+        current_selected_symbol = st.session_state.get('selected_symbol', selected_symbol)
+        
         # Wyświetl nazwę spółki w nagłówku
-        stock_name = get_stock_name(selected_symbol)
-        if stock_name != selected_symbol:
-            st.header(f"{selected_symbol} - {stock_name}")
+        stock_name = get_stock_name(current_selected_symbol)
+        if stock_name != current_selected_symbol:
+            st.header(f"{current_selected_symbol} - {stock_name}")
         else:
-            st.header(f"{selected_symbol}")
+            st.header(f"{current_selected_symbol}")
+        
+        if st.session_state.get('details_fetch_message'):
+            st.success(st.session_state.pop('details_fetch_message'))
+        if st.session_state.get('details_fetch_error'):
+            st.error(st.session_state.pop('details_fetch_error'))
+        
+        st.info("💡 Aby zaktualizować dane dla tej spółki, użyj przycisku '🚀 Uruchom Daily Update' w zakładce Dashboard.")
+        
+        st.divider()
         
         # Znajdź dane dla wybranej spółki
-        selected_data = next((p for p in predictions_data if p['symbol'] == selected_symbol), None)
+        selected_data = next((p for p in predictions_data if p['symbol'] == current_selected_symbol), None)
         
         if selected_data is None:
-            st.warning(f"Brak danych dla {selected_symbol}")
+            st.warning(f"Brak danych dla {current_selected_symbol}")
+            
+            # Przycisk do pobrania danych tylko dla tej jednej spółki
+            if st.button(f"📥 Pobierz dane i wytrenuj model dla {current_selected_symbol}", key=f"fetch_single_{current_selected_symbol}", type="primary"):
+                with st.spinner(f"Pobieranie danych i trenowanie modelu dla {current_selected_symbol}..."):
+                    success, info_msg = run_single_symbol_update(current_selected_symbol, retrain_weekly=True)
+                if success:
+                    message = f"✓ Pobrano dane i wytrenowano model dla {current_selected_symbol}."
+                    if info_msg:
+                        message += f" {info_msg}"
+                    st.session_state['details_fetch_message'] = message
+                else:
+                    st.session_state['details_fetch_error'] = f"Nie udało się pobrać danych dla {current_selected_symbol}: {info_msg}"
+                st.rerun()
         else:
-            with st.spinner(f"Ładowanie danych dla {selected_symbol}..."):
-                predictor = get_predictor_for_symbol(selected_symbol)
+            with st.spinner(f"Ładowanie danych dla {current_selected_symbol}..."):
+                predictor = get_predictor_for_symbol(current_selected_symbol)
             
             if predictor is None:
-                st.error(f"Nie można załadować danych dla {selected_symbol}")
+                st.error(f"Nie można załadować danych dla {current_selected_symbol}")
                 return
             
             # Metryki dla różnych okresów
@@ -1899,8 +2698,46 @@ def main():
                         
                         current_predicted_price = current_predicted_price * (1 + daily_change_pct)
                         
-                        # Przewiduj kierunek dla tego dnia
-                        last_features = predictor.features.iloc[-1:].values
+                        # Przewiduj kierunek dla tego dnia - z dopasowaniem cech
+                        # Sprawdź jakie cechy model oczekuje (kompatybilność wsteczna)
+                        model_expected_features = None
+                        if hasattr(predictor.model, 'feature_names_in_'):
+                            model_expected_features = list(predictor.model.feature_names_in_)
+                        elif hasattr(predictor, 'selected_features') and predictor.selected_features:
+                            model_expected_features = predictor.selected_features
+                        
+                        # Przygotuj features zgodnie z oczekiwaniami modelu
+                        if model_expected_features:
+                            available_features = [f for f in model_expected_features if f in predictor.features.columns]
+                            if len(available_features) != len(model_expected_features) and hasattr(predictor.model, 'feature_names_in_'):
+                                # Model sklearn wymaga dokładnego dopasowania
+                                last_features_df = pd.DataFrame(index=predictor.features.index[-1:])
+                                feature_mapping = {
+                                    'ATR': 'ATR_log',
+                                    'TR': 'TR_log',
+                                    'Volume': 'Volume_log'
+                                }
+                                
+                                for feat in model_expected_features:
+                                    if feat in predictor.features.columns:
+                                        last_features_df[feat] = predictor.features[feat].iloc[-1:]
+                                    elif feat in feature_mapping:
+                                        mapped_feat = feature_mapping[feat]
+                                        if mapped_feat in predictor.features.columns:
+                                            last_features_df[feat] = predictor.features[mapped_feat].iloc[-1:]
+                                        else:
+                                            last_features_df[feat] = 0
+                                    else:
+                                        last_features_df[feat] = 0
+                                
+                                last_features_df = last_features_df[model_expected_features]
+                                last_features = last_features_df.values
+                            else:
+                                last_features = predictor.features[model_expected_features].iloc[-1:].values
+                        else:
+                            # Model nie ma określonych cech - użyj wszystkich dostępnych
+                            last_features = predictor.features.iloc[-1:].values
+                        
                         direction_pred = predictor.model.predict(last_features)[0]
                         direction_proba = predictor.model.predict_proba(last_features)[0]
                         up_probability = direction_proba[1] if len(direction_proba) > 1 else 0.5
@@ -1984,7 +2821,7 @@ def main():
                 )
                 
                 fig_week.update_layout(
-                    title=f'Przewidywania cen na przyszły tydzień - {selected_symbol}',
+                    title=f'Przewidywania cen na przyszły tydzień - {current_selected_symbol}',
                     xaxis_title='Data',
                     yaxis_title='Cena ($)',
                     height=500,
@@ -2035,8 +2872,8 @@ def main():
             st.subheader("📊 Analiza zachowania w ciągu dnia (intraday)")
             
             try:
-                with st.spinner("Pobieranie danych intraday (co minutę)..."):
-                    intraday_data = get_intraday_data(selected_symbol, days=7)
+                with st.spinner("Pobieranie danych intraday (ostatnie 25 dni)..."):
+                    intraday_data = get_intraday_data(current_selected_symbol, days=25)
                 
                 if intraday_data is not None and len(intraday_data) > 0:
                     # Analizuj wzorce
@@ -2157,6 +2994,115 @@ def main():
             except Exception as e:
                 st.warning(f"Błąd przy analizie intraday: {e}")
             
+            # PRZEWIDYWANIA NA PRZYSZŁY TYDZIEŃ - Symulacja intraday
+            st.divider()
+            st.subheader("🔮 Przewidywania na przyszły tydzień - Symulacja intraday")
+            st.caption("💡 Symulacja ruchu cen na podstawie modelu ML i historycznych wzorców. Pokazuje potencjalne dołki, szczyty i okazje transakcyjne.")
+            
+            try:
+                if predictor.model is not None and predictor.data is not None and len(predictor.data) > 0:
+                    with st.spinner("Symulowanie przyszłego tygodnia..."):
+                        # Symuluj przyszły tydzień
+                        simulated_week = simulate_future_week(predictor, days=7)
+                        
+                        if simulated_week is not None and len(simulated_week) > 0:
+                            # Analizuj wzorce w symulacji
+                            sim_patterns = analyze_intraday_patterns(simulated_week)
+                            
+                            if sim_patterns:
+                                # Metryki dla przyszłego tygodnia
+                                col1, col2, col3, col4 = st.columns(4)
+                                
+                                with col1:
+                                    st.metric("⏰ Średni czas dołku (kup)", sim_patterns['avg_low_time'])
+                                with col2:
+                                    st.metric("⏰ Średni czas szczytu (sprzedaj)", sim_patterns['avg_high_time'])
+                                with col3:
+                                    st.metric("📊 Symulowanych dni", len(sim_patterns['daily_patterns']))
+                                with col4:
+                                    avg_change = np.mean([p['change_pct'] for p in sim_patterns['daily_patterns']])
+                                    st.metric("📈 Średnia zmiana dzienna", f"{avg_change:.2f}%")
+                                
+                                # Edge Finder dla przyszłego tygodnia
+                                st.subheader("🎯 Edge Finder - Optymalne momenty transakcji (przyszły tydzień)")
+                                
+                                # Znajdź optymalne pary transakcji w symulacji
+                                future_trading_edges = find_trading_edges(simulated_week, min_profit_pct=0.05, lookback_window=20)
+                                
+                                if future_trading_edges:
+                                    # Pokaż najlepsze okazje w tabeli
+                                    st.info(f"✅ Znaleziono {len(future_trading_edges)} potencjalnych okazji transakcyjnych na przyszły tydzień!")
+                                    
+                                    future_edges_df = pd.DataFrame([
+                                        {
+                                            'Okazja': f"#{idx+1}",
+                                            '🛒 Kup (data/czas)': edge['buy_time'].strftime('%Y-%m-%d %H:%M'),
+                                            '🛒 Cena zakupu': f"${edge['buy_price']:.2f}",
+                                            '💵 Sprzedaj (data/czas)': edge['sell_time'].strftime('%Y-%m-%d %H:%M'),
+                                            '💵 Cena sprzedaży': f"${edge['sell_price']:.2f}",
+                                            '💰 Zysk': f"${edge['profit']:.2f}",
+                                            '📈 Zysk %': f"{edge['profit_pct']:.2f}%",
+                                            '⏱ Czas trwania': f"{edge['duration_minutes']:.0f} min"
+                                        }
+                                        for idx, edge in enumerate(future_trading_edges[:10])  # Pokaż top 10
+                                    ])
+                                    future_edges_df = clean_dataframe_for_streamlit(future_edges_df)
+                                    st.dataframe(future_edges_df, width='stretch', hide_index=True)
+                                    
+                                    # Statystyki
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    with col1:
+                                        avg_profit = np.mean([e['profit_pct'] for e in future_trading_edges])
+                                        st.metric("📊 Średni zysk", f"{avg_profit:.2f}%")
+                                    with col2:
+                                        max_profit = max([e['profit_pct'] for e in future_trading_edges])
+                                        st.metric("🏆 Najlepszy zysk", f"{max_profit:.2f}%")
+                                    with col3:
+                                        avg_duration = np.mean([e['duration_minutes'] for e in future_trading_edges])
+                                        st.metric("⏱ Średni czas", f"{avg_duration:.0f} min")
+                                    with col4:
+                                        total_profit = sum([e['profit'] for e in future_trading_edges])
+                                        st.metric("💵 Łączny potencjał", f"${total_profit:.2f}")
+                                else:
+                                    st.warning("⚠️ Nie znaleziono optymalnych okazji transakcyjnych w symulacji przyszłego tygodnia.")
+                                
+                                st.divider()
+                                
+                                # Wykres świecowy z Edge Finder dla przyszłego tygodnia
+                                st.subheader("🕯️ Wykres świecowy z Edge Finder - Przyszły tydzień (symulacja)")
+                                fig_future_candlestick = plot_candlestick_intraday(simulated_week, sim_patterns, show_edges=True)
+                                if fig_future_candlestick:
+                                    st.plotly_chart(fig_future_candlestick, width='stretch')
+                                    st.caption("💡 Symulacja przyszłego tygodnia. Zielone linie z diamentami (🛒) oznaczają potencjalne momenty zakupu, czerwone strzałki (💵) - momenty sprzedaży.")
+                                
+                                # Tabela z wzorcami dziennymi dla przyszłego tygodnia
+                                st.subheader("📋 Przewidywane wzorce dzienne (przyszły tydzień)")
+                                future_patterns_df = pd.DataFrame([
+                                    {
+                                        'Data': p['date'].strftime('%Y-%m-%d'),
+                                        'Otwarcie': f"${p['open']:.2f}",
+                                        'Zamknięcie': f"${p['close']:.2f}",
+                                        'Min (dołek)': f"${p['low']:.2f}",
+                                        'Max (szczyt)': f"${p['high']:.2f}",
+                                        'Czas dołku': p['low_time'].strftime('%H:%M'),
+                                        'Czas szczytu': p['high_time'].strftime('%H:%M'),
+                                        'Zmiana %': f"{p['change_pct']:.2f}%"
+                                    }
+                                    for p in sim_patterns['daily_patterns']
+                                ])
+                                future_patterns_df = clean_dataframe_for_streamlit(future_patterns_df)
+                                st.dataframe(future_patterns_df, width='stretch', hide_index=True)
+                            else:
+                                st.info("Brak wystarczających danych w symulacji do analizy wzorców.")
+                        else:
+                            st.warning("Nie udało się wygenerować symulacji przyszłego tygodnia.")
+                else:
+                    st.warning("Brak modelu lub danych do symulacji. Najpierw wytrenuj model.")
+            except Exception as e:
+                st.warning(f"Błąd przy symulacji przyszłego tygodnia: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+            
             st.divider()
             
             # Wykres cen (historyczny)
@@ -2196,6 +3142,104 @@ def main():
             
             if selected_data['last_trained']:
                 st.caption(f"Ostatnie trenowanie: {selected_data['last_trained']}")
+            
+            # POPRAWKA DEV: Wyniki out-of-sample i baseline'y
+            try:
+                # Załaduj pełne informacje o modelu
+                predictor = StockPredictor(current_selected_symbol, data_dir='stock_data')
+                if predictor.model_file.exists():
+                    with open(predictor.model_file, 'r') as f:
+                        full_model_info = json.load(f)
+                    
+                    oos_results = full_model_info.get('out_of_sample')
+                    baseline_results = full_model_info.get('baselines')
+                    optimal_threshold = full_model_info.get('optimal_threshold', 0.65)
+                    
+                    if oos_results:
+                        st.divider()
+                        st.subheader("📊 Test Out-of-Sample (ostatnie 6 miesięcy)")
+                        st.caption("💡 Prawdziwy test na danych, których model nie widział podczas trenowania")
+                        
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Accuracy (OOS)", f"{oos_results.get('accuracy', 0):.2%}")
+                        with col2:
+                            st.metric("F1-Score (OOS)", f"{oos_results.get('f1', 0):.4f}")
+                        with col3:
+                            st.metric("Total Return", f"{oos_results.get('total_return', 0):.2%}")
+                        with col4:
+                            st.metric("Sharpe Ratio", f"{oos_results.get('sharpe', 0):.4f}")
+                        
+                        st.caption(f"Liczba transakcji: {oos_results.get('num_trades', 0)} | Optymalny próg: {optimal_threshold:.2f}")
+                    
+                    if baseline_results:
+                        st.divider()
+                        st.subheader("📈 Porównanie z Baseline'ami")
+                        st.caption("💡 Sprawdź czy model faktycznie przebija proste strategie")
+                        
+                        baseline_df = pd.DataFrame([
+                            {
+                                'Strategia': 'Model ML',
+                                'Accuracy': oos_results.get('accuracy', 0) if oos_results else 0,
+                                'Total Return': oos_results.get('total_return', 0) if oos_results else 0,
+                                'Liczba transakcji': oos_results.get('num_trades', 0) if oos_results else 0
+                            },
+                            {
+                                'Strategia': 'Always UP (Buy & Hold)',
+                                'Accuracy': baseline_results.get('always_up', {}).get('accuracy', 0),
+                                'Total Return': baseline_results.get('always_up', {}).get('total_return', 0),
+                                'Liczba transakcji': baseline_results.get('always_up', {}).get('num_trades', 0)
+                            },
+                            {
+                                'Strategia': 'MA Crossover (20/50)',
+                                'Accuracy': baseline_results.get('ma_crossover', {}).get('accuracy', 0),
+                                'Total Return': baseline_results.get('ma_crossover', {}).get('total_return', 0),
+                                'Liczba transakcji': baseline_results.get('ma_crossover', {}).get('num_trades', 0)
+                            },
+                            {
+                                'Strategia': 'Random',
+                                'Accuracy': baseline_results.get('random', {}).get('accuracy', 0),
+                                'Total Return': baseline_results.get('random', {}).get('total_return', 0),
+                                'Liczba transakcji': baseline_results.get('random', {}).get('num_trades', 0)
+                            }
+                        ])
+                        
+                        baseline_df['Accuracy'] = baseline_df['Accuracy'].apply(lambda x: f"{x:.2%}")
+                        baseline_df['Total Return'] = baseline_df['Total Return'].apply(lambda x: f"{x:.2%}")
+                        baseline_df = clean_dataframe_for_streamlit(baseline_df)
+                        st.dataframe(baseline_df, width='stretch', hide_index=True)
+                        
+                        # Wykres porównawczy
+                        if oos_results:
+                            fig_baseline = go.Figure()
+                            strategies = ['Model ML', 'Always UP', 'MA Crossover', 'Random']
+                            returns = [
+                                oos_results.get('total_return', 0),
+                                baseline_results.get('always_up', {}).get('total_return', 0),
+                                baseline_results.get('ma_crossover', {}).get('total_return', 0),
+                                baseline_results.get('random', {}).get('total_return', 0)
+                            ]
+                            
+                            colors = ['green' if r > 0 else 'red' for r in returns]
+                            fig_baseline.add_trace(go.Bar(
+                                x=strategies,
+                                y=returns,
+                                marker_color=colors,
+                                text=[f"{r:.2%}" for r in returns],
+                                textposition='outside'
+                            ))
+                            
+                            fig_baseline.update_layout(
+                                title='Porównanie Total Return - Model vs Baseline\'y',
+                                xaxis_title='Strategia',
+                                yaxis_title='Total Return (%)',
+                                height=400,
+                                showlegend=False
+                            )
+                            
+                            st.plotly_chart(fig_baseline, width='stretch')
+            except Exception as e:
+                st.caption(f"Brak wyników out-of-sample (może wymagać retrenowania modelu): {e}")
     
     with tab3:
         st.header("Wszystkie spółki - Szczegółowa tabela")
@@ -2244,7 +3288,29 @@ def main():
             df_detailed = df_detailed.sort_values('Aktualna cena', ascending=False)
         
         df_detailed = clean_dataframe_for_streamlit(df_detailed)
-        st.dataframe(df_detailed, width='stretch', hide_index=True)
+        
+        # Wyświetl tabelę z kolumną przycisków
+        num_cols = len(df_detailed.columns)
+        header_cols = st.columns([3] * num_cols + [1])
+        for idx, col_name in enumerate(df_detailed.columns):
+            with header_cols[idx]:
+                st.markdown(f"**{col_name}**")
+        with header_cols[-1]:
+            st.markdown("**Szczegóły**")
+        
+        st.divider()
+        
+        # Wyświetl każdy wiersz z przyciskiem
+        for idx, (_, row) in enumerate(df_detailed.iterrows()):
+            row_cols = st.columns([3] * num_cols + [1])
+            for col_idx, col_name in enumerate(df_detailed.columns):
+                with row_cols[col_idx]:
+                    st.write(row[col_name])
+            with row_cols[-1]:
+                if st.button("📈", key=f"details_all_{predictions_data[idx]['symbol']}", help="Przejdź do szczegółów"):
+                    navigate_to_details(predictions_data[idx]['symbol'])
+            if idx < len(df_detailed) - 1:
+                st.divider()
         
         # Eksport
         csv = df_detailed.to_csv(index=False)
@@ -2334,11 +3400,23 @@ def main():
     with tab5:
         st.header("🇩🇪 Indeks DAX - Analiza")
         
-        with st.spinner("Pobieranie danych DAX..."):
-            dax_info = get_dax_data()
+        if st.session_state.get('dax_fetch_message'):
+            st.success(st.session_state.pop('dax_fetch_message'))
+        if st.session_state.get('dax_fetch_error'):
+            st.error(st.session_state.pop('dax_fetch_error'))
+        
+            # Załaduj dane DAX tylko jeśli użytkownik kliknął przycisk
+        if not st.session_state.dax_main_data_loaded:
+            if st.button("📊 Załaduj dane DAX", key="load_dax_main"):
+                st.session_state.dax_main_data_loaded = True
+                st.rerun()
+            dax_info = None
+        else:
+            with st.spinner("Pobieranie danych DAX..."):
+                dax_info = get_dax_data()
         
         if dax_info is None:
-            st.error("Nie udało się pobrać danych dla indeksu DAX")
+            st.warning("⚠️ Brak zapisanego modelu dla indeksu DAX. Uruchom '🚀 Uruchom Daily Update' w zakładce Dashboard aby wytrenować model.")
         else:
             predictor = dax_info['predictor']
             prediction = dax_info['prediction']
@@ -2461,9 +3539,15 @@ def main():
             
             dax_components = get_dax_components()
             
-            # Pobierz dane dla WSZYSTKICH spółek z bazy (dla składników DAX)
-            with st.spinner("Pobieranie danych dla składników DAX..."):
-                all_predictions_for_dax = get_predictions_data(symbols, include_all_from_db=True)
+            # Pobierz dane dla WSZYSTKICH spółek z bazy (dla składników DAX) - tylko jeśli użytkownik kliknął przycisk
+            if not st.session_state.dax_data_loaded:
+                if st.button("📊 Załaduj dane dla składników DAX", key="load_dax_components"):
+                    st.session_state.dax_data_loaded = True
+                    st.rerun()
+                all_predictions_for_dax = []
+            else:
+                with st.spinner("Pobieranie danych dla składników DAX..."):
+                    all_predictions_for_dax = get_dax_predictions(include_all_from_db=True)
             
             # Sprawdź które składniki mamy w danych
             available_components = [comp for comp in dax_components if any(p['symbol'] == comp for p in all_predictions_for_dax)]
@@ -2484,7 +3568,29 @@ def main():
                 ])
                 
                 df_components = clean_dataframe_for_streamlit(df_components)
-                st.dataframe(df_components, width='stretch', hide_index=True)
+                
+                # Wyświetl tabelę z kolumną przycisków
+                num_cols = len(df_components.columns)
+                header_cols = st.columns([3] * num_cols + [1])
+                for idx, col_name in enumerate(df_components.columns):
+                    with header_cols[idx]:
+                        st.markdown(f"**{col_name}**")
+                with header_cols[-1]:
+                    st.markdown("**Szczegóły**")
+                
+                st.divider()
+                
+                # Wyświetl każdy wiersz z przyciskiem
+                for idx, (_, row) in enumerate(df_components.iterrows()):
+                    row_cols = st.columns([3] * num_cols + [1])
+                    for col_idx, col_name in enumerate(df_components.columns):
+                        with row_cols[col_idx]:
+                            st.write(row[col_name])
+                    with row_cols[-1]:
+                        if st.button("📈", key=f"details_component_{component_data[idx]['symbol']}", help="Przejdź do szczegółów"):
+                            navigate_to_details(component_data[idx]['symbol'])
+                    if idx < len(df_components) - 1:
+                        st.divider()
                 
                 # Wykres składników
                 fig_components = go.Figure()
@@ -2551,9 +3657,12 @@ def main():
             if search_term:
                 stocks_to_show = [s for s in stocks_to_show if search_term.upper() in s.upper()]
             
-            # Pobierz dane dla WSZYSTKICH spółek z bazy (dla zakładki DAX)
-            with st.spinner("Pobieranie danych dla wszystkich spółek z bazy..."):
-                all_predictions_data = get_predictions_data(symbols, include_all_from_db=True)
+            # Pobierz dane dla WSZYSTKICH spółek z bazy (dla zakładki DAX) - tylko jeśli dane są już załadowane
+            if st.session_state.get('dax_data_loaded', False):
+                with st.spinner("Pobieranie danych dla wszystkich spółek z bazy..."):
+                    all_predictions_data = get_dax_predictions(include_all_from_db=True)
+            else:
+                all_predictions_data = []
             
             # Sprawdź które mają dane
             available_stocks = [s for s in stocks_to_show if any(p['symbol'] == s for p in all_predictions_data)]
@@ -2583,34 +3692,41 @@ def main():
                         })
                 
                 if stocks_data:
-                    # Utwórz DataFrame z przyciskami ulubionych
                     df_stocks = pd.DataFrame(stocks_data)
-                    df_stocks_clean = clean_dataframe_for_streamlit(df_stocks.drop('Ulubione', axis=1))
+                    df_display = clean_dataframe_for_streamlit(df_stocks.drop(columns=['Ulubione']))
+                    num_cols = len(df_display.columns)
                     
-                    # Wyświetl tabelę z kolumną ulubionych jako przyciski
-                    st.dataframe(
-                        df_stocks_clean,
-                        width='stretch',
-                        hide_index=True
-                    )
-                    
-                    # Przyciski ulubionych w osobnej sekcji
-                    st.subheader("Zarządzaj ulubionymi")
-                    fav_cols = st.columns(min(10, len(stocks_data)))
-                    
-                    for idx, stock_info in enumerate(stocks_data):
-                        symbol = stock_info['Symbol']
-                        is_fav = symbol in st.session_state.favorites
-                        fav_icon = "⭐" if is_fav else "☆"
-                        fav_text = f"{fav_icon} {symbol}"
-                        
-                        col_idx = idx % len(fav_cols)
-                        with fav_cols[col_idx]:
-                            if st.button(fav_text, key=f"fav_btn_{symbol}", width='stretch'):
-                                toggle_favorite(symbol)
-                                st.rerun()
+                    header_cols = st.columns([3] * num_cols + [1, 1])
+                    for idx, col_name in enumerate(df_display.columns):
+                        with header_cols[idx]:
+                            st.markdown(f"**{col_name}**")
+                    with header_cols[-2]:
+                        st.markdown("**Ulubione**")
+                    with header_cols[-1]:
+                        st.markdown("**Szczegóły**")
                     
                     st.divider()
+                    
+                    for idx, (_, row) in enumerate(df_display.iterrows()):
+                        row_cols = st.columns([3] * num_cols + [1, 1])
+                        for col_idx, col_name in enumerate(df_display.columns):
+                            with row_cols[col_idx]:
+                                st.write(row[col_name])
+                        
+                        symbol = df_stocks.iloc[idx]['Symbol']
+                        is_fav = symbol in st.session_state.favorites
+                        fav_label = "⭐" if is_fav else "☆"
+                        with row_cols[-2]:
+                            if st.button(fav_label, key=f"dax_fav_toggle_{symbol}", help="Dodaj/usuń z ulubionych"):
+                                toggle_favorite(symbol)
+                                st.rerun()
+                        
+                        with row_cols[-1]:
+                            if st.button("📈", key=f"details_german_{symbol}", help="Przejdź do szczegółów"):
+                                navigate_to_details(symbol)
+                        
+                        if idx < len(df_display) - 1:
+                            st.divider()
             
             # Pokaż spółki bez danych (jeśli są)
             if unavailable_stocks and filter_type != 'Ulubione':
@@ -2625,10 +3741,25 @@ def main():
                                 is_fav = symbol in st.session_state.favorites
                                 fav_icon = "⭐" if is_fav else "☆"
                                 with col:
-                                    if st.button(fav_icon, key=f"fav_na_{symbol}", help=f"{symbol}"):
-                                        toggle_favorite(symbol)
-                                        st.rerun()
-                                    st.caption(symbol)
+                                    st.markdown(f"**{symbol}**")
+                                    action_cols = st.columns(2)
+                                    with action_cols[0]:
+                                        if st.button(fav_icon, key=f"fav_na_{symbol}", help="Dodaj/usuń z ulubionych"):
+                                            toggle_favorite(symbol)
+                                            st.rerun()
+                                    with action_cols[1]:
+                                        if st.button("📥", key=f"dax_fetch_{symbol}", help="Pobierz dane z internetu"):
+                                            with st.spinner(f"Pobieranie danych dla {symbol}..."):
+                                                success, info_msg = run_single_symbol_update(symbol, retrain_weekly=True)
+                                            if success:
+                                                message = f"✓ Pobrano dane dla {symbol}."
+                                                if info_msg:
+                                                    message += f" {info_msg}"
+                                                st.session_state['dax_fetch_message'] = message
+                                            else:
+                                                st.session_state['dax_fetch_error'] = f"Nie udało się pobrać danych dla {symbol}: {info_msg}"
+                                            st.rerun()
+                                    st.caption("Dodaj do ulubionych lub pobierz dane.")
             
             # Statystyki ulubionych
             if st.session_state.favorites:
@@ -2651,7 +3782,29 @@ def main():
                     ])
                     
                     df_fav = clean_dataframe_for_streamlit(df_fav)
-                    st.dataframe(df_fav, width='stretch', hide_index=True)
+                    
+                    # Wyświetl tabelę z kolumną przycisków
+                    num_cols = len(df_fav.columns)
+                    header_cols = st.columns([3] * num_cols + [1])
+                    for idx, col_name in enumerate(df_fav.columns):
+                        with header_cols[idx]:
+                            st.markdown(f"**{col_name}**")
+                    with header_cols[-1]:
+                        st.markdown("**Szczegóły**")
+                    
+                    st.divider()
+                    
+                    # Wyświetl każdy wiersz z przyciskiem
+                    for idx, (_, row) in enumerate(df_fav.iterrows()):
+                        row_cols = st.columns([3] * num_cols + [1])
+                        for col_idx, col_name in enumerate(df_fav.columns):
+                            with row_cols[col_idx]:
+                                st.write(row[col_name])
+                        with row_cols[-1]:
+                            if st.button("📈", key=f"details_dax_fav_{favorite_predictions[idx]['symbol']}", help="Przejdź do szczegółów"):
+                                navigate_to_details(favorite_predictions[idx]['symbol'])
+                        if idx < len(df_fav) - 1:
+                            st.divider()
                 else:
                     st.info("Brak danych dla ulubionych spółek. Uruchom najpierw daily_update.py")
                 
@@ -2660,6 +3813,186 @@ def main():
                     st.session_state.favorites = []
                     save_favorites()
                     st.rerun()
+    
+    with tab6:
+        st.header("📊 Skuteczność predykcji - Analiza logu")
+        st.caption("💡 Analiza historycznej skuteczności modelu na podstawie zapisanych predykcji")
+        
+        if not PREDICTION_LOGGING_AVAILABLE:
+            st.warning("⚠️ Moduł logowania predykcji nie jest dostępny. Upewnij się, że pliki prediction_logger.py i calibration.py istnieją.")
+        else:
+            # Utwórz logger
+            logger = PredictionLogger(data_dir='stock_data', use_sqlite=True)
+            
+            # Przycisk do aktualizacji wyników
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🔄 Aktualizuj wyniki predykcji", width='stretch'):
+                    with st.spinner("Aktualizowanie wyników..."):
+                        update_prediction_outcomes(logger, max_days_lookback=60)
+                    st.success("✓ Wyniki zaktualizowane!")
+                    st.rerun()
+            
+            with col2:
+                if st.button("🎯 Trenuj kalibrator i znajdź optymalny próg", width='stretch'):
+                    with st.spinner("Trenowanie kalibratora i strojenie progu..."):
+                        # Użyj filtrów z sekcji poniżej
+                        selected_symbol = None if filter_symbol == 'Wszystkie' else filter_symbol
+                        
+                        # Trenuj kalibrator
+                        calibrator_path = Path('stock_data') / f'{selected_symbol or "global"}_calibrator.pkl'
+                        calibrator = train_calibrator(
+                            logger,
+                            symbol=selected_symbol,
+                            horizon_days=filter_horizon,
+                            save_path=calibrator_path
+                        )
+                        
+                        # Znajdź optymalny próg
+                        threshold_path = Path('stock_data') / f'{selected_symbol or "global"}_threshold.json'
+                        threshold_result = find_best_threshold(
+                            logger,
+                            symbol=selected_symbol,
+                            horizon_days=filter_horizon,
+                            save_path=threshold_path
+                        )
+                        
+                        if threshold_result:
+                            st.success(f"✓ Optymalny próg: {threshold_result['best_threshold']:.2f}")
+            
+            st.divider()
+            
+            # Filtry do analizy
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                filter_symbol = st.selectbox("Symbol:", ['Wszystkie'] + symbols, key='pred_stats_symbol')
+            with col2:
+                filter_horizon = st.selectbox("Horyzont (dni):", [None, 1, 5, 30, 180], key='pred_stats_horizon')
+            with col3:
+                filter_filled = st.selectbox("Status:", ['Wszystkie', 'Z wynikami', 'Bez wyników'], key='pred_stats_filled')
+            
+            # Pobierz statystyki
+            selected_symbol = None if filter_symbol == 'Wszystkie' else filter_symbol
+            
+            stats = logger.get_statistics(
+                symbol=selected_symbol,
+                horizon_days=filter_horizon
+            )
+            
+            # Wyświetl statystyki
+            if stats['total_predictions'] > 0:
+                st.subheader("📈 Statystyki skuteczności")
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Liczba predykcji", stats['total_predictions'])
+                with col2:
+                    st.metric("Hit Rate", f"{stats['hit_rate']:.2%}")
+                with col3:
+                    st.metric("Średni zwrot", f"{stats['avg_return']:.4f}")
+                with col4:
+                    st.metric("Liczba transakcji", stats['num_trades'])
+                
+                # Pobierz szczegółowe dane do wykresów
+                df_calibration = logger.get_predictions_for_calibration(
+                    symbol=selected_symbol,
+                    horizon_days=filter_horizon,
+                    min_predictions=1
+                )
+                
+                if len(df_calibration) > 0:
+                    st.divider()
+                    st.subheader("📊 Wykresy analityczne")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        # Rozkład prawdopodobieństw vs rzeczywiste wyniki
+                        st.subheader("Kalibracja prawdopodobieństw")
+                        fig_cal = go.Figure()
+                        
+                        # Grupuj prawdopodobieństwa w przedziały
+                        bins = np.arange(0, 1.1, 0.1)
+                        df_calibration['proba_bin'] = pd.cut(df_calibration['proba_up'], bins=bins, labels=bins[:-1])
+                        
+                        # Oblicz średni rzeczywisty zwrot dla każdego przedziału
+                        calibration_data = df_calibration.groupby('proba_bin').agg({
+                            'return_realized': 'mean',
+                            'was_correct': 'mean'
+                        }).reset_index()
+                        
+                        fig_cal.add_trace(go.Scatter(
+                            x=calibration_data['proba_bin'],
+                            y=calibration_data['was_correct'],
+                            mode='lines+markers',
+                            name='Rzeczywista trafność',
+                            line=dict(color='blue', width=2)
+                        ))
+                        
+                        # Linia idealnej kalibracji (y=x)
+                        fig_cal.add_trace(go.Scatter(
+                            x=[0, 1],
+                            y=[0, 1],
+                            mode='lines',
+                            name='Idealna kalibracja',
+                            line=dict(color='red', dash='dash', width=1)
+                        ))
+                        
+                        fig_cal.update_layout(
+                            title='Kalibracja prawdopodobieństw',
+                            xaxis_title='Przewidywane prawdopodobieństwo',
+                            yaxis_title='Rzeczywista trafność',
+                            height=400
+                        )
+                        st.plotly_chart(fig_cal, width='stretch')
+                    
+                    with col2:
+                        # Rozkład zwrotów
+                        st.subheader("Rozkład zwrotów")
+                        fig_returns = px.histogram(
+                            df_calibration,
+                            x='return_realized',
+                            nbins=50,
+                            labels={'return_realized': 'Zwrot (log)', 'count': 'Liczba'},
+                            title='Rozkład zrealizowanych zwrotów'
+                        )
+                        st.plotly_chart(fig_returns, width='stretch')
+                    
+                    # Wykres P&L w czasie
+                    st.subheader("💰 P&L w czasie")
+                    df_calibration_sorted = df_calibration.sort_values('timestamp_prediction')
+                    df_calibration_sorted['cumulative_return'] = df_calibration_sorted['return_realized'].cumsum()
+                    
+                    fig_pnl = go.Figure()
+                    fig_pnl.add_trace(go.Scatter(
+                        x=pd.to_datetime(df_calibration_sorted['timestamp_prediction']),
+                        y=df_calibration_sorted['cumulative_return'],
+                        mode='lines',
+                        name='Skumulowany zwrot',
+                        line=dict(color='green', width=2)
+                    ))
+                    
+                    fig_pnl.update_layout(
+                        title='Skumulowany zwrot w czasie',
+                        xaxis_title='Data predykcji',
+                        yaxis_title='Skumulowany zwrot (log)',
+                        height=400
+                    )
+                    st.plotly_chart(fig_pnl, width='stretch')
+                    
+                    # Tabela szczegółowa
+                    st.subheader("📋 Szczegółowa tabela predykcji")
+                    display_df = df_calibration[['timestamp_prediction', 'symbol', 'horizon_days', 
+                                                  'price_at_prediction', 'proba_up', 'decision',
+                                                  'price_at_outcome', 'return_realized', 'was_correct']].copy()
+                    display_df['timestamp_prediction'] = pd.to_datetime(display_df['timestamp_prediction'])
+                    display_df = display_df.sort_values('timestamp_prediction', ascending=False)
+                    display_df = clean_dataframe_for_streamlit(display_df)
+                    st.dataframe(display_df.head(100), width='stretch', hide_index=True)
+                else:
+                    st.info("Brak danych do wyświetlenia. Uruchom najpierw aktualizację wyników.")
+            else:
+                st.info("Brak zapisanych predykcji. Predykcje są automatycznie logowane podczas przewidywań.")
 
 if __name__ == "__main__":
     main()

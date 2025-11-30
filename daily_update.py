@@ -7,6 +7,13 @@ from stock_predictor import MultiStockPredictor
 from datetime import datetime
 import sys
 
+# Import modułu aktualizacji wyników (opcjonalnie)
+try:
+    from prediction_logger import PredictionLogger, update_prediction_outcomes
+    PREDICTION_LOGGING_AVAILABLE = True
+except ImportError:
+    PREDICTION_LOGGING_AVAILABLE = False
+
 def main():
     print(f"\n{'='*80}")
     print(f"CODZIENNA AKTUALIZACJA - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -26,6 +33,20 @@ def main():
         if results:
             multi_predictor.generate_report(results)
             print(f"\n✓ Aktualizacja zakończona pomyślnie dla {len(results)} spółek")
+        
+        # Aktualizuj wyniki predykcji (jeśli moduł jest dostępny)
+        if PREDICTION_LOGGING_AVAILABLE:
+            print(f"\n{'='*80}")
+            print("AKTUALIZACJA WYNIKÓW PREDYKCJI")
+            print(f"{'='*80}")
+            try:
+                logger = PredictionLogger(data_dir='stock_data', use_sqlite=True)
+                update_prediction_outcomes(logger, max_days_lookback=60)
+                print("✓ Aktualizacja wyników zakończona")
+            except Exception as e:
+                print(f"⚠ Błąd przy aktualizacji wyników: {e}")
+        
+        if results:
             return 0
         else:
             print("\n✗ Brak wyników")
