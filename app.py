@@ -1841,7 +1841,7 @@ def main():
         st.header("⚙️ Ustawienia")
         
         # Przycisk do uruchomienia daily_update w tle
-        if st.button("🚀 Uruchom Daily Update", width='stretch', type="primary"):
+        if st.button("🚀 Uruchom Daily Update", type="primary"):
             if 'update_running' not in st.session_state:
                 st.session_state.update_running = False
             
@@ -1883,7 +1883,7 @@ def main():
             elapsed = datetime.now() - start_time
             st.info(f"🔄 Aktualizacja w toku... (czas: {elapsed.seconds}s)")
             st.caption("Możesz kontynuować korzystanie z aplikacji - używa ostatnich zapisanych danych")
-        elif st.button("📥 Pobierz dane z Yahoo teraz (blokuje UI)", width='stretch'):
+        elif st.button("📥 Pobierz dane z Yahoo teraz (blokuje UI)"):
             with st.spinner("Pobieranie danych i trenowanie modeli..."):
                 try:
                     results = run_full_daily_update(include_german_stocks=True, all_german_stocks=True)
@@ -1923,7 +1923,7 @@ def main():
                         st.caption(f"... i {len(results) - 20} więcej spółek")
                 
                 # Przycisk do zamknięcia powiadomienia
-                if st.button("✖️ Zamknij powiadomienie", key="close_notification", width='stretch'):
+                if st.button("✖️ Zamknij powiadomienie", key="close_notification"):
                     st.session_state.update_results = None
                     st.session_state.update_completed = False
                     st.rerun()
@@ -2010,7 +2010,7 @@ def main():
                         remove_custom_ticker(ticker)
                         st.rerun()
             
-            if st.button("🗑️ Usuń wszystkie", use_container_width=True):
+            if st.button("🗑️ Usuń wszystkie"):
                 st.session_state.custom_tickers = []
                 save_custom_tickers()
                 st.rerun()
@@ -3809,7 +3809,7 @@ def main():
                     st.info("Brak danych dla ulubionych spółek. Uruchom najpierw daily_update.py")
                 
                 # Przycisk do usunięcia wszystkich ulubionych
-                if st.button("🗑️ Usuń wszystkie ulubione", width='stretch'):
+                if st.button("🗑️ Usuń wszystkie ulubione"):
                     st.session_state.favorites = []
                     save_favorites()
                     st.rerun()
@@ -3827,14 +3827,14 @@ def main():
             # Przycisk do aktualizacji wyników
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("🔄 Aktualizuj wyniki predykcji", width='stretch'):
+                if st.button("🔄 Aktualizuj wyniki predykcji"):
                     with st.spinner("Aktualizowanie wyników..."):
                         update_prediction_outcomes(logger, max_days_lookback=60)
                     st.success("✓ Wyniki zaktualizowane!")
                     st.rerun()
             
             with col2:
-                if st.button("🎯 Trenuj kalibrator i znajdź optymalny próg", width='stretch'):
+                if st.button("🎯 Trenuj kalibrator i znajdź optymalny próg"):
                     with st.spinner("Trenowanie kalibratora i strojenie progu..."):
                         # Użyj filtrów z sekcji poniżej
                         selected_symbol = None if filter_symbol == 'Wszystkie' else filter_symbol
