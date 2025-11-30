@@ -42,6 +42,8 @@ class StockPredictor:
         self.data_file = self.data_dir / f'{symbol}_data.csv'
         self.model_file = self.data_dir / f'{symbol}_model.json'
         self.model_pickle_file = self.data_dir / f'{symbol}_model.pkl'
+        self.latest_close_price = None
+        self.latest_close_date = None
         self.weekly_model_pickle_file = self.data_dir / f'{symbol}_weekly_model.pkl'
         self.features_file = self.data_dir / f'{symbol}_features.json'
         self.weekly_features_file = self.data_dir / f'{symbol}_weekly_features.json'
@@ -87,6 +89,25 @@ class StockPredictor:
         combined.to_csv(self.data_file)
         print(f"Zapisano {len(combined)} dni danych dla {self.symbol}")
         return combined
+    
+    def _update_latest_close_metadata(self):
+        """Aktualizuj informacje o ostatniej cenie zamknięcia."""
+        if self.data is not None and len(self.data) > 0 and 'Close' in self.data.columns:
+            try:
+                self.latest_close_price = float(self.data['Close'].iloc[-1])
+            except Exception:
+                self.latest_close_price = None
+            try:
+                last_idx = self.data.index[-1]
+                if hasattr(last_idx, 'date'):
+                    self.latest_close_date = last_idx.date()
+                else:
+                    self.latest_close_date = None
+            except Exception:
+                self.latest_close_date = None
+        else:
+            self.latest_close_price = None
+            self.latest_close_date = None
     
     def convert_symbol_for_yfinance(self, symbol):
         """Konwertuj symbol do formatu rozpoznawanego przez yfinance"""
@@ -178,6 +199,7 @@ class StockPredictor:
                 # Użyj TYLKO lokalnych danych - nie pobieraj z Yahoo
                 self.log(f"Używam zapisanych danych lokalnych (ostatnia data: {last_date.date()})")
                 self.data = historical
+                self._update_latest_close_metadata()
                 return self.data
             else:
                 # Brak zapisanych danych - zwróć None zamiast pobierać z Yahoo
@@ -213,6 +235,7 @@ class StockPredictor:
         
         # Zapisz dane (zawsze zapisuj, nawet jeśli use_saved=False, aby mieć dane na przyszłość)
         self.data = self.save_historical_data(self.data)
+        self._update_latest_close_metadata()
         
         self.log(f"Zapisano {len(self.data)} dni danych (nowy cache).")
         return self.data
@@ -1217,7 +1240,10 @@ class StockPredictor:
         up_probability = direction_proba[1] if len(direction_proba) > 1 else 0.5
         down_probability = 1 - up_probability
         
-        current_price = self.data['Close'].iloc[-1]
+        if self.latest_close_price is not None:
+            current_price = self.latest_close_price
+        else:
+            current_price = self.data['Close'].iloc[-1]
         
         # POPRAWKA 4: Próg decyzyjny 0.65 zamiast 0.5
         # Sygnał BUY jeśli up_probability > 0.65
