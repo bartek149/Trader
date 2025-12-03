@@ -3840,10 +3840,11 @@ def main():
                         current_filter_symbol = st.session_state.get('pred_stats_symbol', 'Wszystkie')
                         selected_symbol = None if current_filter_symbol == 'Wszystkie' else current_filter_symbol
                         calibrator_path = Path('stock_data') / f'{selected_symbol or "global"}_calibrator.pkl'
+                        current_filter_horizon = st.session_state.get('pred_stats_horizon', None)
                         calibrator = train_calibrator(
                             logger,
                             symbol=selected_symbol,
-                            horizon_days=filter_horizon,
+                            horizon_days=current_filter_horizon,
                             save_path=calibrator_path
                         )
                         
@@ -3852,7 +3853,7 @@ def main():
                         threshold_result = find_best_threshold(
                             logger,
                             symbol=selected_symbol,
-                            horizon_days=filter_horizon,
+                            horizon_days=current_filter_horizon,
                             save_path=threshold_path
                         )
                         
@@ -3871,6 +3872,8 @@ def main():
                 filter_symbol = 'Wszystkie'
             with col2:
                 filter_horizon = st.selectbox("Horyzont (dni):", [None, 1, 5, 30, 180], key='pred_stats_horizon')
+                if filter_horizon == 'None':
+                    filter_horizon = None
             with col3:
                 filter_filled = st.selectbox("Status:", ['Wszystkie', 'Z wynikami', 'Bez wyników'], key='pred_stats_filled')
             
