@@ -3864,8 +3864,13 @@ def main():
             
             # Filtry do analizy
             col1, col2, col3 = st.columns(3)
+            symbol_filter_options = ['Wszystkie']
+            if symbols:
+                symbol_filter_options.extend(symbols)
             with col1:
-                filter_symbol = st.selectbox("Symbol:", ['Wszystkie'] + symbols, key='pred_stats_symbol')
+                filter_symbol = st.selectbox("Symbol:", symbol_filter_options, key='pred_stats_symbol')
+            if 'filter_symbol' not in locals():
+                filter_symbol = 'Wszystkie'
             with col2:
                 filter_horizon = st.selectbox("Horyzont (dni):", [None, 1, 5, 30, 180], key='pred_stats_horizon')
             with col3:
