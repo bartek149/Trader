@@ -3836,10 +3836,9 @@ def main():
             with col2:
                 if st.button("🎯 Trenuj kalibrator i znajdź optymalny próg"):
                     with st.spinner("Trenowanie kalibratora i strojenie progu..."):
-                        # Użyj filtrów z sekcji poniżej
-                        selected_symbol = None if filter_symbol == 'Wszystkie' else filter_symbol
-                        
                         # Trenuj kalibrator
+                        current_filter_symbol = st.session_state.get('pred_stats_symbol', 'Wszystkie')
+                        selected_symbol = None if current_filter_symbol == 'Wszystkie' else current_filter_symbol
                         calibrator_path = Path('stock_data') / f'{selected_symbol or "global"}_calibrator.pkl'
                         calibrator = train_calibrator(
                             logger,
@@ -3867,9 +3866,8 @@ def main():
             symbol_filter_options = ['Wszystkie']
             if symbols:
                 symbol_filter_options.extend(symbols)
-            with col1:
-                filter_symbol = st.selectbox("Symbol:", symbol_filter_options, key='pred_stats_symbol')
-            if 'filter_symbol' not in locals():
+            filter_symbol = st.selectbox("Symbol:", symbol_filter_options, key='pred_stats_symbol')
+            if not filter_symbol:
                 filter_symbol = 'Wszystkie'
             with col2:
                 filter_horizon = st.selectbox("Horyzont (dni):", [None, 1, 5, 30, 180], key='pred_stats_horizon')
